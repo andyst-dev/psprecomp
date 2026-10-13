@@ -183,6 +183,13 @@ int      psp_intr_enabled(void);       /* registered *and* enabled */
 uint64_t psp_intr_deliveries(void);
 uint64_t psp_intr_unresolved(void);    /* handler address that is not recompiled */
 
+/* How many threads were created and how many were actually started. The gap
+ * between the two is the first thing to look at when a game waits on a flag
+ * nothing ever arms: a created-but-never-started worker explains it exactly,
+ * and no other instrument shows the difference. */
+uint64_t psp_threadman_created(void);
+uint64_t psp_threadman_started(void);
+
 /* Bytes of user memory still available — the cheapest end-to-end check that
  * the allocator is behaving. */
 uint32_t psp_sysmem_free(void);
