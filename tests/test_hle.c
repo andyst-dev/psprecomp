@@ -223,6 +223,25 @@ static void fake_thread_entry(void) {
     psp_cpu.r[PSP_REG_V0] = 0x1234;      /* exit status */
 }
 
+/* An entry that blocks, so the test drives the scheduler rather than only
+ * observing that a body ran once. It records how far it got, and the only
+ * thing that moves it past the sleep is a wakeup from another thread. */
+static int g_sleeper_stage;
+static void fake_sleeper_entry(void) {
+    g_sleeper_stage = 1;
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    g_sleeper_stage = 2;
+}
+
+/* And one that blocks on a semaphore, which is a different wake path. */
+static uint32_t g_test_sema;
+static int      g_waiter_stage;
+static void fake_waiter_entry(void) {
+    g_waiter_stage = 1;
+    call(psp_nid("sceKernelWaitSema"), g_test_sema, 1, 0 /* no timeout */, 0);
+    g_waiter_stage = 2;
+}
+
 static void test_threads(void) {
     psp_sysmem_reset();
     psp_threadman_reset();
@@ -233,6 +252,10 @@ static void test_threads(void) {
     const uint32_t WAITEND= psp_nid("sceKernelWaitThreadEnd");
     const uint32_t DELETE = psp_nid("sceKernelDeleteThread");
     const uint32_t GETID  = psp_nid("sceKernelGetThreadId");
+    const uint32_t DELAY  = psp_nid("sceKernelDelayThread");
+    const uint32_t WAKEUP = psp_nid("sceKernelWakeupThread");
+    const uint32_t CREATESEMA = psp_nid("sceKernelCreateSema");
+    const uint32_t SIGNAL = psp_nid("sceKernelSignalSema");
 
     const uint32_t ENTRY = 0x08801000u;
     psp_register(ENTRY, fake_thread_entry);
@@ -247,29 +270,147 @@ static void test_threads(void) {
     g_thread_ran = 0;
     uint32_t rc = call(START, thid, 7 /*arglen*/, 0xAAAA, 0);
     CHECK(rc == 0, "start succeeds");
-    CHECK(g_thread_ran == 1, "the thread entry actually ran");
+    /* The contract that unblocks a game: StartThread returns with the body not
+     * yet entered. A caller that runs the body inline never gets to post the
+     * work that body is waiting for. */
+    CHECK(g_thread_ran == 0, "StartThread returns before the body is entered");
+
+    CHECK(psp_cpu.r[PSP_REG_S0] == 0xC0FFEE, "caller's registers restored");
+
+    /* The exit status the thread returned is what a waiter sees -- and waiting
+     * is also how the caller gives the CPU away, so the body runs here. */
+    uint32_t out = 0x08802000u;
+    CHECK(call(WAITEND, thid, out, 0, 0) == 0, "wait-for-end succeeds");
+    CHECK(g_thread_ran == 1, "the thread entry ran once the caller gave up the CPU");
     CHECK(g_thread_arg == 7, "argument reached the thread, got %u", g_thread_arg);
     CHECK(g_thread_sp != caller_sp && g_thread_sp != 0,
           "the thread ran on its own stack (0x%08X vs caller 0x%08X)",
           g_thread_sp, caller_sp);
     CHECK((g_thread_sp & 15) == 0, "the thread stack pointer is 16-byte aligned");
-
-    CHECK(psp_cpu.r[PSP_REG_S0] == 0xC0FFEE, "caller's registers restored");
-    CHECK(psp_cpu.r[PSP_REG_SP] == caller_sp, "caller's stack pointer restored");
-
-    /* The exit status the thread returned is what a waiter sees. */
-    uint32_t out = 0x08802000u;
-    CHECK(call(WAITEND, thid, out, 0, 0) == 0, "wait-for-end succeeds");
     CHECK(psp_read32(out) == 0x1234, "exit status recorded, got 0x%X", psp_read32(out));
+    CHECK(psp_cpu.r[PSP_REG_SP] == caller_sp, "caller's stack pointer restored");
 
     /* Deleting frees the stack. */
     uint32_t before_delete = psp_sysmem_free();
     CHECK(call(DELETE, thid, 0, 0, 0) == 0, "delete succeeds");
     CHECK(psp_sysmem_free() > before_delete, "deleting a thread frees its stack");
 
+    /* A thread that sleeps stays asleep until it is woken, and the thing that
+     * wakes it is another thread -- no amount of time passing does. */
+    const uint32_t SLEEPER = 0x08801080u;
+    psp_register(SLEEPER, fake_sleeper_entry);
+    uint32_t sid = call5(CREATE, 0, SLEEPER, 32, 0x4000, 0);
+    g_sleeper_stage = 0;
+    CHECK(call(START, sid, 0, 0, 0) == 0, "second thread started");
+
+    call(DELAY, 1000, 0, 0, 0);        /* the caller parks: the sleeper gets in */
+    CHECK(g_sleeper_stage == 1, "the sleeper ran and then blocked on SleepThread");
+
+    /* A sleep with nothing to wake it still ends, one tick later. That is the
+     * approximation that keeps a `while (!flag) sleep();` poll alive: the
+     * faithful alternative is a thread that never returns, and a run that
+     * stops with no evidence in it. */
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(g_sleeper_stage == 2, "a sleep nothing wakes returns after its tick");
+
+    /* A wakeup is not lost when it arrives before the sleep: a producer that
+     * wakes a worker it has not started waiting yet must not have to guess. */
+    uint32_t sid2 = call5(CREATE, 0, SLEEPER, 32, 0x4000, 0);
+    g_sleeper_stage = 0;
+    CHECK(call(START, sid2, 0, 0, 0) == 0, "third thread started");
+    CHECK(call(WAKEUP, sid2, 0, 0, 0) == 0, "wakeup succeeds");
+    CHECK(call(WAITEND, sid2, 0, 0, 0) == 0, "and that sleeper reaches its end");
+    CHECK(g_sleeper_stage == 2, "the pending wakeup is consumed, not stranded");
+
+    /* The same shape over a semaphore: a wait with no timeout blocks, and a
+     * signal from another thread is what releases it. */
+    const uint32_t WAITER = 0x08801090u;
+    psp_register(WAITER, fake_waiter_entry);
+    g_test_sema = call5(CREATESEMA, 0, 0, 0 /*init*/, 4 /*max*/, 0);
+    CHECK(g_test_sema != 0, "semaphore created for the waiter");
+    uint32_t wid = call5(CREATE, 0, WAITER, 32, 0x4000, 0);
+    g_waiter_stage = 0;
+    CHECK(call(START, wid, 0, 0, 0) == 0, "waiter started");
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(g_waiter_stage == 1, "the waiter blocked on an empty semaphore");
+
+    CHECK(call(SIGNAL, g_test_sema, 1, 0, 0) == 0, "signal succeeds");
+    CHECK(call(WAITEND, wid, 0, 0, 0) == 0, "the waiter reaches its end");
+    CHECK(g_waiter_stage == 2, "the signal released it");
+
     CHECK(call(START, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_THID,
           "starting an unknown thread is refused");
-    CHECK(call(GETID, 0, 0, 0, 0) == 0, "no current thread outside one");
+    /* The host thread running the module entry is a thread too: it is the one
+     * whose call we are inside, so it has to have an identity of its own. */
+    CHECK(call(GETID, 0, 0, 0, 0) != 0,
+          "the thread running the module entry has an id");
+}
+
+/* Variable-size pools. The value that matters most here is the first one: a
+ * created pool must have a handle that is not zero, because a stubbed create
+ * returning zero is indistinguishable from a successful create of pool 0 --
+ * and that is exactly what stopped LocoRoco in its own initialisation. */
+static void test_vpl(void) {
+    psp_sysmem_reset();
+    psp_threadman_reset();
+
+    const uint32_t CREATE = psp_nid("sceKernelCreateVpl");
+    const uint32_t ALLOC  = psp_nid("sceKernelAllocateVplCB");
+    const uint32_t TRYALLOC = psp_nid("sceKernelTryAllocateVpl");
+    const uint32_t FREE   = psp_nid("sceKernelFreeVpl");
+    const uint32_t REFER  = psp_nid("sceKernelReferVplStatus");
+    const uint32_t DELETE = psp_nid("sceKernelDeleteVpl");
+    const uint32_t MAXFREE= psp_nid("sceKernelMaxFreeMemSize");
+
+    const uint32_t NAME = 0x08804000u;
+    const char *nm = "sceVplName";
+    for (uint32_t i = 0; i <= strlen(nm); i++) psp_write8(NAME + i, (uint8_t)nm[i]);
+
+    uint32_t vpl = call5(CREATE, NAME, 2 /*partition*/, 0, 4096 /*size*/, 0);
+    CHECK(vpl != 0, "a created pool has a handle, not zero");
+
+    uint32_t out  = 0x08804100u;
+    uint32_t to   = 0x08804110u;
+    uint32_t info = 0x08804200u;
+
+    psp_write32(out, 0);
+    psp_write32(to, 1000);
+    CHECK(call(ALLOC, vpl, 256, out, to) == 0, "a block is handed out");
+    uint32_t blk = psp_read32(out);
+    CHECK(blk != 0, "and its address is not zero");
+
+    /* The block is real guest memory, not a plausible-looking number. */
+    psp_write32(blk, 0xABCDEF01u);
+    CHECK(psp_read32(blk) == 0xABCDEF01u, "the block is addressable guest memory");
+
+    psp_write32(info, 52);
+    CHECK(call(REFER, vpl, info, 0, 0) == 0, "status is reported");
+    CHECK(psp_read32(info + 40) == 4096, "pool size is reported, got %u", psp_read32(info + 40));
+    CHECK(psp_read32(info + 44) == 4096 - 256,
+          "free size accounts for the allocation, got %u", psp_read32(info + 44));
+    char back[32];
+    for (int i = 0; i < 32; i++) back[i] = (char)psp_read8(info + 4 + (uint32_t)i);
+    CHECK(strcmp(back, nm) == 0, "the name round-trips, got \"%s\"", back);
+
+    /* A request bigger than the pool must not be answered with a block. */
+    CHECK(call(ALLOC, vpl, 8192, out, to) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+          "a request larger than the pool times out rather than succeeding");
+    CHECK(call(TRYALLOC, vpl, 8192, out, 0) == SCE_KERNEL_ERROR_WAIT_TIMEOUT,
+          "and the try variant never blocks");
+
+    /* Freeing gives the room back, and only a block this pool handed out. */
+    CHECK(call(FREE, vpl, blk, 0, 0) == 0, "free succeeds");
+    CHECK(call(REFER, vpl, info, 0, 0) == 0 && psp_read32(info + 44) == 4096,
+          "freeing gives the room back");
+    CHECK(call(FREE, vpl, 0x08805000u, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK,
+          "a pointer the pool never handed out is refused");
+
+    /* Memory the game can see is not reported as zero. */
+    CHECK(call(MAXFREE, 0, 0, 0, 0) > 0, "free memory is reported, not zero");
+
+    CHECK(call(DELETE, vpl, 0, 0, 0) == 0, "delete succeeds");
+    CHECK(call(ALLOC, vpl, 16, out, to) == SCE_KERNEL_ERROR_UNKNOWN_UID,
+          "a deleted pool is gone");
 }
 
 static void test_guest_strings(void) {
@@ -415,6 +556,7 @@ int main(void) {
     test_semaphores();
     test_event_flags();
     test_threads();
+    test_vpl();
     test_guest_strings();
     test_ge_display_list();
     test_ge_infinite_list();

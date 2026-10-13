@@ -108,6 +108,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201A9
 #define SCE_KERNEL_ERROR_ILLEGAL_THID    0x80020197
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT    0x800201A8
+#define SCE_KERNEL_ERROR_THREAD_TERMINATED 0x800201AC
+#define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
+#define SCE_KERNEL_ERROR_EVF_COND        0x800201AF
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -152,6 +155,33 @@ uint64_t psp_audio_blocks(void);
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
+
+/* ---- the scheduler -------------------------------------------------------
+ *
+ * One CPU, handed over explicitly: the boot thread (whoever calls
+ * psp_threadman_reset) runs the module entry, and a thread that blocks gives
+ * the CPU away until it is woken. These are the points where that happens,
+ * for use by the rest of the HLE layer. See src/hle/threadman.c. */
+
+/* Give the CPU away without blocking on anything of the guest's. A frame wait
+ * is the usual caller: one core means "let a frame pass" is "let the others
+ * run". */
+void psp_threadman_yield(void);
+void psp_threadman_frame_wait(void);
+
+/* Interrupt masking is per thread, and the cookie is the previous state --
+ * which is why resuming a nested suspend does not enable interrupts. */
+int  psp_threadman_intr_suspend(void);
+void psp_threadman_intr_resume(uint32_t cookie);
+int  psp_threadman_intr_disabled(void);
+
+/* What the scheduler did, for a host's report. `switches` counts CPU
+ * handovers and `parks` counts blocked calls: a run with threads and no
+ * switches has not actually run them. */
+uint64_t psp_threadman_switches(void);
+uint64_t psp_threadman_parks(void);
+uint64_t psp_threadman_vtime_us(void);
+void     psp_threadman_dump(FILE *out);
 
 /* How many threads were created and how many were actually started. The gap
  * between the two is the first thing to look at when a game waits on a flag
