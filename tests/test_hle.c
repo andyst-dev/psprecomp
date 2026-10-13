@@ -401,6 +401,135 @@ static void test_display(void) {
           "vblank waits advance the frame counter (the bring-up heartbeat)");
 }
 
+/* The shape LocoRoco got stuck on: register a handler, enable it, then wait for
+ * something the handler arms. The wait has to deliver, because the guest's exit
+ * condition is set by the handler -- a wait that returns without delivering is
+ * a loop that cannot end (2 900 000 000 iterations, measured). */
+static int      g_handler_calls;
+static uint32_t g_handler_sub, g_handler_arg;
+
+static void fake_subintr_handler(void) {
+    /* Reads its arguments the way a recompiled handler would. */
+    g_handler_sub = psp_cpu.r[PSP_REG_A0];
+    g_handler_arg = psp_cpu.r[PSP_REG_A1];
+    g_handler_calls++;
+}
+
+static void fake_subintr_handler_that_waits(void) {
+    g_handler_calls++;
+    psp_intr_tick();   /* a handler that waits must not recurse */
+}
+
+static void test_sub_interrupts(void) {
+    psp_intrman_reset();
+    g_handler_calls = 0;
+    g_handler_sub = g_handler_arg = 0;
+
+    const uint32_t FN = 0x0000A000u;
+    psp_register(FN, fake_subintr_handler);
+
+    /* (intno, no, handler, arg) */
+    CHECK(call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, FN, 0x1234) == 0,
+          "register a sub-interrupt handler");
+    CHECK(psp_intr_handlers() == 1, "handler recorded");
+    CHECK(psp_intr_enabled() == 0, "and starts disabled, as it does on hardware");
+
+    /* Registered but not enabled: a wait must not deliver. */
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    CHECK(g_handler_calls == 0 && psp_intr_deliveries() == 0,
+          "a disabled handler is not called");
+
+    CHECK(call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0) == 0,
+          "enable returns the previous state (0 = was disabled)");
+    CHECK(psp_intr_enabled() == 1, "handler enabled");
+
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    CHECK(g_handler_calls == 1 && psp_intr_deliveries() == 1,
+          "the wait delivers one interrupt");
+    CHECK(g_handler_sub == 2 && g_handler_arg == 0x1234,
+          "handler receives (subintr, arg)");
+    CHECK(psp_cpu.r[PSP_REG_A0] == 0 && psp_cpu.r[PSP_REG_A1] == 0,
+          "the interrupted context's registers survive the handler");
+
+    /* A delay and a vblank wait are the other two delivery points. */
+    call(psp_nid("sceKernelDelayThread"), 0, 0, 0, 0);
+    call(psp_nid("sceDisplayWaitVblank"), 0, 0, 0, 0);
+    CHECK(g_handler_calls == 3, "DelayThread and the vblank wait deliver too");
+
+    /* Reentrancy: a handler that waits is serviced later, not recursively. */
+    g_handler_calls = 0;
+    psp_intrman_reset();
+    psp_register(FN, fake_subintr_handler_that_waits);
+    call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, FN, 0);
+    call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    CHECK(g_handler_calls == 1, "a handler that waits does not re-enter delivery");
+
+    /* A handler address that discovery never found is counted and named, not
+     * silently skipped -- that failure would look like the bug this fixes. */
+    psp_intrman_reset();
+    call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, 0x0000BEEFu, 0);
+    call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    CHECK(psp_intr_unresolved() == 1 && psp_intr_deliveries() == 0,
+          "an unrecompiled handler address is counted as unresolved");
+
+    /* Releasing stops delivery. */
+    psp_intrman_reset();
+    g_handler_calls = 0;
+    psp_register(FN, fake_subintr_handler);
+    call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, FN, 0);
+    call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+    CHECK(call(psp_nid("sceKernelReleaseSubIntrHandler"), 1, 2, 0, 0) == 0,
+          "release");
+    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
+    CHECK(g_handler_calls == 0 && psp_intr_handlers() == 0,
+          "a released handler is not called");
+}
+
+/* The unsubscribe-from-a-stub case: a game that spins on a call nobody
+ * implemented. It made 26 926 971 log lines -- 1.37 GB -- in one 30-second run,
+ * for a single call worth naming. */
+static void test_unimplemented_logging(void) {
+    psp_hle_unimplemented_reset();
+    CHECK(psp_hle_unimplemented_calls() == 0, "counter starts at zero");
+
+    /* Relative, because the zero-return total is a running total since start-up,
+     * not a per-test counter -- earlier tests have already made calls. */
+    uint64_t zero_before = psp_hle_zero_calls();
+
+    for (int i = 0; i < 100000; i++) psp_hle_call(0xDEAD0001u);   /* nobody registered this */
+
+    CHECK(psp_hle_unimplemented_calls() == 100000,
+          "every unimplemented call is counted");
+    CHECK(psp_hle_unimplemented_logged() <= 9,
+          "but only a bounded number are printed (was one per call: 1.37 GB)");
+    CHECK(psp_cpu.r[PSP_REG_V0] == 0,
+          "and the call still returns 0, as it did before");
+
+    /* The dump keeps a 16-entry ring but counts all of them, and the count has
+     * to survive passing the ring -- an `int` here wrapped and printed
+     * `last -1396532617 firmware calls`. */
+    CHECK(psp_hle_zero_calls() == zero_before + 100000,
+          "the zero-return ring's total counts past its own size");
+
+    FILE *f = tmpfile();
+    if (f) {
+        psp_hle_dump_recent(f);
+        rewind(f);
+        char buf[1024] = {0};
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        char expect[64];
+        snprintf(expect, sizeof expect, "%llu in total",
+                 (unsigned long long)(zero_before + 100000));
+        CHECK(got > 0 && strstr(buf, expect) != NULL,
+              "the dump reports the true total: %s", buf);
+        CHECK(strstr(buf, "last 16 firmware calls") != NULL,
+              "and caps its listing at the ring size, with no negative count");
+    }
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -420,6 +549,8 @@ int main(void) {
     test_ge_infinite_list();
     test_sas_adpcm();
     test_display();
+    test_sub_interrupts();
+    test_unimplemented_logging();
 
     psp_mem_free();
 

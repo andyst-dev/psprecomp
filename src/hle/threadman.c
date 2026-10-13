@@ -222,18 +222,26 @@ static void hle_DeleteThread(void) {
 }
 
 /* With one thread running to completion there is nothing to schedule during a
- * delay, so it returns immediately. Time still advances for anything reading
- * the clock. */
-static void hle_DelayThread(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
+ * delay, so it returns immediately -- but a delay is still the guest asking for
+ * time to pass, so it is also a point where an interrupt is delivered
+ * (src/hle/intrman.c). Time advances for anything reading the clock, and
+ * handlers run. */
+static void hle_DelayThread(void)   { psp_intr_tick(); psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* sceKernelSleepThread[CB] blocks until sceKernelWakeupThread -- which, under
- * a run-to-completion model with no other thread ever scheduled, never
- * happens. Returning OK immediately is the same approximation DelayThread
- * already makes (see the file header): a game that sleeps waiting on a
- * worker thread this host cannot run will still proceed on a wrong timing
- * assumption, which beats hanging forever and is the same trade-off the
- * module already accepts for every other blocking primitive here. */
-static void hle_SleepThread(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
+ * a run-to-completion model with no other thread ever scheduled, never happens.
+ * Returning OK immediately is the approximation this file makes for every
+ * blocking primitive here.
+ *
+ * That approximation has a cost this comment used to argue away: "a game that
+ * sleeps waiting on a worker thread will still proceed on a wrong timing
+ * assumption, which beats hanging forever". Measured on LocoRoco, it does not
+ * proceed. Such a game *polls* -- `while (!flag) sleep();` -- so an immediate
+ * return means the poll never ends: 2 900 000 000 iterations in 30 seconds, at
+ * the same address, with the loop's exit condition never becoming true. What
+ * was missing was not the sleep but the interrupt that arms the flag being
+ * polled, so the wait now delivers one. */
+static void hle_SleepThread(void)   { psp_intr_tick(); psp_ret(SCE_KERNEL_ERROR_OK); }
 
 static void hle_WaitThreadEnd(void) {
     /* The thread already ran to completion inside StartThread, so by the time

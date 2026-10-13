@@ -42,6 +42,7 @@ add_library(psprecomp STATIC
     src/hle/hle.c
     src/hle/sysmem.c
     src/hle/threadman.c
+    src/hle/intrman.c
     src/hle/display.c
     src/hle/ge.c
     src/hle/sascore.c

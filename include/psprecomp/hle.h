@@ -43,6 +43,16 @@ void psp_hle_call(uint32_t nid);
 /* Look up what is registered, for reporting. Returns NULL if absent. */
 const char *psp_hle_name(uint32_t nid);
 int         psp_hle_count(void);
+/* The message naming an unimplemented call is printed a bounded number of
+ * times; these are how much was kept back. `calls` is the number that tells a
+ * silenced message from one that stopped happening -- see the comment on
+ * UNIMPL_LOGGED in hle.c. */
+uint64_t psp_hle_unimplemented_calls(void);
+uint64_t psp_hle_unimplemented_logged(void);
+void     psp_hle_unimplemented_reset(void);
+
+/* Every zero-returning call ever made, not just the ZERO_HISTORY ring. */
+uint64_t psp_hle_zero_calls(void);
 
 /* Every registered entry, for the coverage report a game repo wants: which of
  * a module's imports actually exist yet. */
@@ -152,6 +162,26 @@ uint64_t psp_audio_blocks(void);
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
+
+/* InterruptManager: sub-interrupt handlers, and the points where an interrupt
+ * is delivered. See the header of src/hle/intrman.c for why a game can be
+ * stuck in a loop that no amount of implementing `sleep` gets it out of. */
+void psp_intrman_init(void);
+void psp_intrman_register(void);
+void psp_intrman_reset(void);
+
+/* Deliver one interrupt to every enabled handler. Called from the places where
+ * the guest explicitly waits for time to pass -- SleepThread, DelayThread and
+ * the vblank wait -- since with no timer there is nothing else to hook. Safe to
+ * call from inside a handler: delivery does not re-enter. */
+void psp_intr_tick(void);
+
+/* 0 until a game registers a handler, and the first number worth looking at
+ * when a wait never ends. */
+int      psp_intr_handlers(void);      /* registered */
+int      psp_intr_enabled(void);       /* registered *and* enabled */
+uint64_t psp_intr_deliveries(void);
+uint64_t psp_intr_unresolved(void);    /* handler address that is not recompiled */
 
 /* Bytes of user memory still available — the cheapest end-to-end check that
  * the allocator is behaving. */

@@ -132,6 +132,9 @@ static void hle_SetFrameBuf(void) {
  * stuck. */
 static void hle_WaitVblank(void) {
     g_vblank_count++;
+    /* A frame boundary is the guest asking for time to pass, so it is the third
+     * point where an interrupt is delivered (src/hle/intrman.c). */
+    psp_intr_tick();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
