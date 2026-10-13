@@ -326,29 +326,53 @@ int psp_trace_was_marked(uint32_t addr) {
  * loads a plausible wrong value instead of failing. That is invisible until
  * the wrong value is dereferenced, far from the cause.
  *
- * Checking the invariant at every return finds the culprit directly. */
+ * Checking the invariant at every return finds the culprit directly.
+ *
+ * The two signs are not the same thing, and only one of them is a bug. A
+ * *positive* delta is what a split continuation reports: a body that holds an
+ * epilogue but not its matching prologue, which discovery makes a separate
+ * body, so the invariant does not hold for it. A *negative* delta is stack
+ * consumed and never returned, and that is the one that poisons everything
+ * downstream. Counting them together buries the second under the first -- a run
+ * on LocoRoco reached 549 million violations of which the informative part was
+ * a handful -- so the first leak is named, with its $sp, the entry it expected
+ * and the last function entered, and the two counts stay separate. */
 static uint64_t g_sp_bad;
+static uint64_t g_sp_leaks;
 static uint32_t g_sp_first;
 static int32_t  g_sp_delta;
+static uint32_t g_sp_first_in, g_sp_first_out, g_sp_first_last;
 
 void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
     if (sp_in == sp_out) return;
-    /* Print them all. A *positive* delta usually means a split continuation
-     * that contains an epilogue but not its matching prologue -- discovery
-     * makes those separate bodies, so the invariant does not hold for them and
-     * they are noise. A *negative* delta is the dangerous case: stack consumed
-     * and never returned. */
+    int32_t d = (int32_t)(sp_out - sp_in);
     if (g_sp_bad < 24)
-        fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn,
-                (int)(sp_out - sp_in),
-                (int32_t)(sp_out - sp_in) < 0 ? "   <-- leak" : "");
-    if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = (int32_t)(sp_out - sp_in); }
+        fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn, (int)d,
+                d < 0 ? "   <-- leak" : "");
+    if (d < 0) {
+        if (!g_sp_leaks) {
+            g_sp_first = fn;
+            g_sp_delta = d;
+            g_sp_first_in = sp_in;
+            g_sp_first_out = sp_out;
+            g_sp_first_last = psp_trace_last();
+            fprintf(stderr,
+                    "sp LEAK: 0x%08X ne rend pas %d octets, $sp 0x%08X -> 0x%08X, "
+                    "derniere entree 0x%08X\n",
+                    fn, (int)-d, sp_in, sp_out, g_sp_first_last);
+        }
+        g_sp_leaks++;
+    }
     g_sp_bad++;
 }
 
 uint64_t psp_sp_violations(void) { return g_sp_bad; }
+uint64_t psp_sp_leaks(void)      { return g_sp_leaks; }
 uint32_t psp_sp_first_bad(void)  { return g_sp_first; }
 int32_t  psp_sp_first_delta(void){ return g_sp_delta; }
+uint32_t psp_sp_first_in(void)   { return g_sp_first_in; }
+uint32_t psp_sp_first_out(void)  { return g_sp_first_out; }
+uint32_t psp_sp_first_last(void) { return g_sp_first_last; }
 
 /* Stack imbalance observed across a call. Complements psp_trace_sp: that one
  * checks a body against its own entry and is blind to leaks that straddle a

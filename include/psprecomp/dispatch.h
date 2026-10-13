@@ -64,8 +64,14 @@ void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
 void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after);
 uint64_t psp_sp_call_violations(void);
 uint64_t psp_sp_violations(void);
+uint64_t psp_sp_leaks(void);
 uint32_t psp_sp_first_bad(void);
 int32_t  psp_sp_first_delta(void);
+/* Le contexte de la premiere fuite : l'entree attendue, celle observee, et la
+ * derniere fonction entree au moment ou elle a ete vue. */
+uint32_t psp_sp_first_in(void);
+uint32_t psp_sp_first_out(void);
+uint32_t psp_sp_first_last(void);
 void psp_trace_watch_label(uint32_t addr, void (*fn)(uint32_t));
 void psp_trace_marks_init(uint32_t lo, uint32_t words);
 int psp_trace_was_marked(uint32_t addr);
