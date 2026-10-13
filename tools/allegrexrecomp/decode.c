@@ -554,9 +554,19 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         case 7: op = A_VFIM; break;
         default: op = A_VFPU_UNKNOWN; break;
         }
-        out->vd = (word >> 16) & 0x7F;
-        out->imm = (int32_t)(int16_t)(word & 0xFFFF);
-        out->vsize = 1;
+        if (op == A_VIIM || op == A_VFIM) {
+            /* This family has no `vd`: its single destination is spelled in
+             * bits 16..22, the field the other VFPU forms call `vt`. Assign the
+             * LOCAL `in`, because a_decode closes with `*out = in` -- writing to
+             * `out` here is undone before the caller sees it, and the caller is
+             * handed the generic `vd = word & 0x7F` instead. Measured on
+             * LocoRoco (UCES00304): 0xDF967E81 is a vfim to register 22 and the
+             * emitter was writing register 1. `imm` needs no case here: the
+             * epilogue's default is SIMM16, which is exactly this field's
+             * signed low halfword. */
+            in.vd = (word >> 16) & 0x7F;
+            in.vsize = 1;
+        }
         break;
     case 0x19:
         switch ((word >> 23) & 7) {

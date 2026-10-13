@@ -215,6 +215,31 @@ static void test_vfpu(void) {
     dec(0xC8000000, 0x08900000, A_LV_S, "lv.s");
     dec(0xE8000000, 0x08900000, A_SV_S, "sv.s");
 
+    /* viim/vfim spell their single destination in the `vt` field, bits 16..22.
+     * The case used to assign those fields to `out`, which a_decode's closing
+     * `*out = in` then overwrote with the generic `vd = word & 0x7F`: the
+     * destination reached the emitter wrong, so the generated C wrote a
+     * different VFPU register than the hardware would.
+     * Words below are real ones from LocoRoco (UCES00304), cross-checked
+     * against the independent ghidra-allegrex sleigh. */
+    in = dec(0xDF967E81, 0x08900000, A_VFIM, "vfim.s v22, NaN halfword");
+    CHECK(in.vd == 22, "vfim destination is the vt field (bits 16..22): got %u", in.vd);
+    CHECK(in.vsize == 1, "an immediate load writes a single lane: got %u", in.vsize);
+    CHECK((uint16_t)in.imm == 0x7E81, "vfim immediate is its low halfword: got 0x%04X",
+          (unsigned)(uint16_t)in.imm);
+
+    in = dec(0xDF969B81, 0x08900000, A_VFIM, "vfim.s v22, -0.00366401672");
+    CHECK(in.vd == 22 && (uint16_t)in.imm == 0x9B81,
+          "a second vfim keeps its own destination and immediate");
+
+    in = dec(0xDFFFFFFF, 0x08900000, A_VFIM, "vfim.s v127, NaN halfword");
+    CHECK(in.vd == 127, "vfim destination of 127 survives: got %u", in.vd);
+
+    /* Same family, sub-opcode 6: bits 25..23 select the integer form. */
+    in = dec(0xDF160000, 0x08900000, A_VIIM, "viim.s v22");
+    CHECK(in.vd == 22, "viim destination is also the vt field: got %u", in.vd);
+    CHECK(in.vsize == 1, "viim writes a single lane: got %u", in.vsize);
+
     /* VFPU0 family: sub-opcode in bits 25..23. */
     dec(0x60000000, 0x08900000, A_VADD, "vadd");
     dec(0x60800000, 0x08900000, A_VSUB, "vsub");
