@@ -50,6 +50,10 @@ void psp_dispatch(uint32_t addr);
  * than recording it, and a short history of entered functions also shows how
  * the code arrived, not just where it was. */
 void psp_trace_enter(uint32_t addr);
+/* Profondeur de pile hote atteinte, echantillonnee a l'entree des fonctions.
+ * Zero quand la plateforme ne sait pas ou commence la pile du thread. */
+uint64_t psp_stack_high_water(void);
+void psp_stack_note(void);
 void psp_trace_dump(void);
 void psp_trace_reset(void);
 uint32_t psp_trace_last(void);

@@ -80,6 +80,25 @@
 
 #define HOST_STACK_BYTES (16u * 1024u * 1024u)
 
+/* Le plafond mesurable : ce n'est pas le rapport entre les deux tailles qui
+ * compte, c'est la profondeur reellement atteinte. Mesure sur LocoRoco : 16 Mo
+ * ne suffisent pas, la pile hote se termine au fond d'une division 64 bits
+ * (la faute tombe a l'entree d'une fonction, $sp sur la page de garde), et le
+ * processus meurt sur un acces memoire au lieu de rendre un rapport.
+ *
+ * PSPRECOMP_HOST_STACK_MB permet de balayer la taille sans recompiler : c'est
+ * ce qui distingue une recursion profonde mais bornee d'un emballement.
+ * Le rapport de l'hote imprime la profondeur atteinte, donc la valeur se
+ * choisit sur une mesure et non sur une impression. */
+static size_t host_stack_bytes(void) {
+    const char *e = getenv("PSPRECOMP_HOST_STACK_MB");
+    if (e) {
+        long mb = strtol(e, NULL, 10);
+        if (mb >= 1 && mb <= 1024) return (size_t)mb << 20;
+    }
+    return HOST_STACK_BYTES;
+}
+
 enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
 
 /* What a parked thread is waiting for. A wake is targeted: signalling a
@@ -557,6 +576,15 @@ static void *guest_thread_main(void *arg) {
     g_tls_me = t;
     g_current = t;
 
+#ifdef __APPLE__
+    /* La taille de pile reellement obtenue, pas celle demandee : c'est elle qui
+     * borne la profondeur d'appel invitee, et un plantage au fond d'une
+     * recursion se lit differemment selon qu'elle vaut 512 Ko ou 64 Mo. */
+    fprintf(stderr, "thread %u : pile hote %lu Ko, sommet %p\n", t->uid,
+            (unsigned long)(pthread_get_stacksize_np(pthread_self()) / 1024u),
+            pthread_get_stackaddr_np(pthread_self()));
+#endif
+
     /* A fresh register file: a thread must not see the leftovers of whatever
      * ran before it. $sp and the o32 argument registers are the firmware's to
      * set, everything else starts at zero. */
@@ -648,7 +676,7 @@ static void hle_StartThread(void) {
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, HOST_STACK_BYTES);
+    pthread_attr_setstacksize(&attr, host_stack_bytes());
     int rc = pthread_create(&t->host, &attr, guest_thread_main, t);
     pthread_attr_destroy(&attr);
     if (rc != 0) {

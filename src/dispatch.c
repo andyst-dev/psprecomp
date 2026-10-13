@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <pthread.h>     /* pthread_get_stackaddr_np : la sonde de pile hote */
+#endif
 
 /* An open-addressed hash table. A module has a few thousand functions and
  * lookups happen on every indirect call, so this wants to be cheap; addresses
@@ -120,9 +123,42 @@ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t)) {
 
 void psp_trace_enter(uint32_t addr) {
     if (addr == g_watch_addr && g_watch_fn) g_watch_fn(addr);
+    psp_stack_note();
     g_trace[g_trace_n % TRACE_DEPTH] = addr;
     g_trace_n++;
 }
+
+/* La profondeur de pile hote reellement atteinte.
+ *
+ * Un appel recompile est un appel C, donc la profondeur d'appel invitee est la
+ * profondeur de pile hote -- et une pile hote qui se termine se manifeste par un
+ * acces memoire sur sa page de garde, a l'entree d'une fonction, sans aucun
+ * rapport visible avec la cause. Mesure sur LocoRoco : le processus mourait en
+ * 51 ms avec une pile hote de 16 Mo, la faute tombant dans psp_trace_enter,
+ * $sp au fond de la zone de pile. Aucun gestionnaire de signal ne s'executait,
+ * parce qu'un signal ne peut pas se poser sur une pile epuisee : la seule trace
+ * etait un code de sortie.
+ *
+ * Mesurer la profondeur transforme ce plantage muet en un chiffre, et c'est le
+ * chiffre qui choisit la taille de pile.
+ *
+ * Echantillonne a une entree sur 4096 : l'appel a pthread_get_stackaddr_np
+ * n'est pas gratuit, et un maximum ne se perd pas en etant lu moins souvent. */
+static uint64_t g_stack_used;
+
+void psp_stack_note(void) {
+    static uint64_t n;
+    if ((n++ & 0xFFFu) != 0) return;
+#ifdef __APPLE__
+    char probe;
+    void *top = pthread_get_stackaddr_np(pthread_self());
+    if (!top) return;
+    uint64_t used = (uint64_t)((char *)top - &probe);
+    if (used > g_stack_used && used < (1ull << 32)) g_stack_used = used;
+#endif
+}
+
+uint64_t psp_stack_high_water(void) { return g_stack_used; }
 
 void psp_trace_reset(void) { g_trace_n = 0; }
 
