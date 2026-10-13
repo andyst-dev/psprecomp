@@ -652,9 +652,43 @@ static void emit_function(ectx *c, const a_func *fn) {
              * middle. Transfer control explicitly and stop emitting: everything
              * after the gap is reachable through its own entry. */
             if (!last_terminal) {
+                /* The gap runs from `a` to the next address this body owns. That
+                 * address is where the hardware lands when the fragment stops,
+                 * and it is usually the rest of THIS body -- typically its
+                 * epilogue, which is what restores $sp and the saved registers.
+                 *
+                 * Returning instead of jumping there is a silent divergence: the
+                 * frame is never popped, so the caller's `lw $ra, N($sp)` reads
+                 * the wrong slot. Measured on LocoRoco: 0x3E4 saves
+                 * $s0/$s1/$s2/$s3 and its epilogue sits at 0x450; its call loop
+                 * falls into the fragment 0x42C, the `return` skipped 0x450, and
+                 * the initialiser-table walker resumed with $s0=0x8E43F4 and
+                 * $s3=0x61368 where it expected its cursor and its end -- so its
+                 * `while (++s0 < s3)` stopped immediately and entries [10]..[99]
+                 * of the table never ran. The game then read an object-registry
+                 * pointer that only entry [29] writes, and spun 3.6 billion
+                 * times scanning the module's code as if it were that table.
+                 *
+                 * Only when the fragment can fall out of its own end, and only
+                 * when the continuation already carries a label in this body: a
+                 * fragment that ends in `jr`/`j` never falls through, and its
+                 * internal `jr $ra` reaches the caller through the same C call,
+                 * so a jump there would run the continuation at the wrong time. */
+                uint32_t cont = a;
+                while (cont < fn->end && !owned_by(an, cont, owner)) cont += 4;
+                int can_fall_out = 1;
+                if (cont >= 4 && cont <= fn->end) {
+                    a_insn fi;
+                    a_decode(fetch(an, cont - 4), cont - 4, &fi);
+                    can_fall_out = !(fi.is_return || fi.is_indirect ||
+                                     (fi.is_jump && !fi.is_call));
+                }
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
                 emit_static_call(c, a);
-                fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
+                if (cont < fn->end && can_fall_out && c->is_label[widx(an, cont)])
+                    fprintf(f, "    goto L_%08X;   /* the fragment's fall-out lands here */\n", cont);
+                else
+                    fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
                 last_terminal = 1;
             }
             continue;
