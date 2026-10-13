@@ -880,12 +880,11 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
         " * before running anything. */\n"
         "void psp_recomp_register(void);\n"
         "\n"
-        "/* Provided by the host: a firmware call this module imports, and the\n"
-        " * traps for anything not yet translated. */\n"
-        "void psp_syscall(uint32_t id);\n"
-        "void psp_unimplemented(uint32_t addr, const char *what);\n"
+        "/* psp_syscall() and psp_unimplemented() are declared by\n"
+        " * <psprecomp/recomp_rt.h>, which this header includes, and defined by\n"
+        " * the runtime -- so the emitted C links without the host supplying\n"
+        " * them. */\n"
         "\n");
-
     for (int i = 0; i < an->nfuncs; i++)
         fprintf(f, "void psp_func_%08X(void);\n", an->funcs[i].addr);
 

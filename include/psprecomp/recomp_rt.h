@@ -247,6 +247,19 @@ static inline int psp_fcmp(unsigned cond, float a, float b) {
     }
 }
 
+/* The two calls the emitter emits but cannot translate: a `syscall` and
+ * anything it does not yet know how to lower. The generated header used to
+ * declare these itself, which meant the emitted C compiled and then failed to
+ * link for any game that contained one -- LocoRoco (UCES00304) emits 11 and
+ * 15 646 of them. They live here so every translation unit that includes this
+ * header sees exactly one declaration, the same rule the rest of the file
+ * follows. */
+void psp_syscall(uint32_t id);
+void psp_unimplemented(uint32_t addr, const char *what);
+uint64_t psp_syscall_total(void);
+uint64_t psp_unimplemented_total(void);
+void psp_trap_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

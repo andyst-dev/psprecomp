@@ -38,6 +38,7 @@ add_library(psprecomp STATIC
     src/ctors.c
     src/render.c
     src/vfpu.c
+    src/traps.c
     src/hle/hle.c
     src/hle/sysmem.c
     src/hle/threadman.c
