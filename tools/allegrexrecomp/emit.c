@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>      /* isnan / isinf for the VFPU immediate loads */
 
 /* Generated register names: r_a0, r_sp, ... The generated header #defines each
  * onto psp_cpu.r[N]. Naming them beats indexing because the emitted code then
@@ -435,10 +436,22 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VIIM:
         fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vd, (double)in->imm);
         return;
-    case A_VFIM:
-        fprintf(f, "%spsp_vimm(%u, %.9gf);\n", ind, in->vd,
-                (double)half_to_float((uint16_t)in->imm));
+    case A_VFIM: {
+        /* A half-precision immediate can encode an infinity or a NaN, and
+         * neither survives the float conversion: `%.9gf` renders a NaN as
+         * `nan`, to which the format's literal `f` suffix then glues itself, so
+         * the generated C holds the invalid token `nanf` and the file does not
+         * compile. Spell the non-finite values with the C99 macros instead --
+         * they need <math.h>, which <psprecomp/recomp_rt.h> provides to every
+         * generated unit. (LocoRoco, UCES00304, emits three of these.) */
+        const float v = half_to_float((uint16_t)in->imm);
+        if (isnan(v))      fprintf(f, "%spsp_vimm(%u, NAN);\n", ind, in->vd);
+        else if (isinf(v)) fprintf(f, "%spsp_vimm(%u, %sINFINITY);\n",
+                                   ind, in->vd, v < 0 ? "-" : "");
+        else               fprintf(f, "%spsp_vimm(%u, %.9gf);\n",
+                                   ind, in->vd, (double)v);
         return;
+    }
 
     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
     case A_VMMUL:

@@ -164,6 +164,70 @@ int main(void) {
 
     a_analysis_free(&an);
 
+    /* ---- viim/vfim: destination register and non-finite immediates ---------
+     * One real word from LocoRoco (UCES00304). Two separate defects used to
+     * show up on it, so both are asserted here:
+     *   - the destination came out as 1 where the encoding says 22, so the
+     *     generated C wrote the wrong VFPU register;
+     *   - the NaN halfword rendered as `nanf`, an invalid token that stopped
+     *     the emitted file from compiling at all.
+     */
+    static const uint32_t CODE_VFIM[] = {
+        0xDF967E81u,   /* vfim v22,  NaN halfword        */
+        0xDFFF7C00u,   /* vfim v127, +Inf halfword       */
+        0xDF96FC00u,   /* vfim v22,  -Inf halfword       */
+        0xDF969B81u,   /* vfim v22,  -0.00366401672      */
+        0x03E00008u,   /* jr $ra                         */
+        0x00000000u,
+    };
+    uint8_t code2[sizeof CODE_VFIM];
+    for (size_t i = 0; i < sizeof CODE_VFIM / sizeof CODE_VFIM[0]; i++) {
+        code2[i * 4 + 0] = (uint8_t)(CODE_VFIM[i]);
+        code2[i * 4 + 1] = (uint8_t)(CODE_VFIM[i] >> 8);
+        code2[i * 4 + 2] = (uint8_t)(CODE_VFIM[i] >> 16);
+        code2[i * 4 + 3] = (uint8_t)(CODE_VFIM[i] >> 24);
+    }
+
+    a_analysis an2;
+    memset(&an2, 0, sizeof an2);
+    an2.code = code2;
+    an2.base = BASE;
+    an2.size = (uint32_t)sizeof code2;
+
+    uint32_t seed2 = BASE;
+    CHECK(a_discover(&an2, &seed2, 1) == 0, "vfim discovery runs");
+
+    emit_opts o2;
+    o2.outdir = ".";
+    o2.prefix = "t_vfim";
+    o2.module = "synthetic";
+    CHECK(a_emit(&an2, &o2) == 0, "vfim emission succeeds");
+
+    char *vsrc = slurp("./t_vfim_funcs.c", NULL);
+    CHECK(vsrc != NULL, "generated vfim .c is readable");
+    if (vsrc) {
+        /* The destination is the encoding's vt field, not the generic vd. */
+        expect_contains(vsrc, "psp_vimm(22, ",
+                        "the destination is the encoding's vt field (bits 16..22)");
+        expect_contains(vsrc, "psp_vimm(127, ",
+                        "a destination of 127 survives the round trip");
+        /* The immediates: all three branches of the non-finite handling. */
+        expect_contains(vsrc, "psp_vimm(22, NAN);",
+                        "a NaN halfword is spelled with the C99 NAN macro");
+        expect_contains(vsrc, "psp_vimm(127, INFINITY);",
+                        "a +Inf halfword is spelled INFINITY");
+        expect_contains(vsrc, "psp_vimm(22, -INFINITY);",
+                        "a -Inf halfword keeps its sign");
+        expect_contains(vsrc, "psp_vimm(22, -0.00366401672f);",
+                        "a finite halfword is emitted as before");
+        /* `%.9gf` glued the format's literal `f` onto printf's `nan` and `inf`
+         * output, giving these two invalid tokens. Neither may come back. */
+        CHECK(strstr(vsrc, "nanf") == NULL, "no invalid `nanf` token");
+        CHECK(strstr(vsrc, "inff") == NULL, "no invalid `inff` token");
+        free(vsrc);
+    }
+    a_analysis_free(&an2);
+
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
         return 1;

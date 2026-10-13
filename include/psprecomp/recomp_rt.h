@@ -17,6 +17,7 @@
 #include "mem.h"
 
 #include <stdint.h>
+#include <math.h>      /* NAN / INFINITY: a VFPU immediate can encode either */
 
 #ifdef __cplusplus
 extern "C" {
