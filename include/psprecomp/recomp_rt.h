@@ -59,6 +59,18 @@ static inline void psp_multu(uint32_t a, uint32_t b) {
     psp_cpu.hi = (uint32_t)(r >> 32);
 }
 
+/* A zero divisor is reported once, with the dividend and the function that did
+ * it. The result below is defined by this runtime and not by the machine, so
+ * nothing in the guest's own behaviour says that a zero divisor ever happened:
+ * the game takes the value and goes on. On LocoRoco that value fed a
+ * `do { c = v % 10 ; v /= 10 } while (rem)` loop, whose remainder then stood
+ * still, so the loop wrote one digit per turn while walking its cursor backwards
+ * over memory: 2.8 billion bad accesses in thirty seconds, and the module's own
+ * initialiser table read back as ASCII digits. One predictable branch buys a
+ * named line instead. */
+void psp_div_by_zero(uint32_t dividend, const char *what);
+uint64_t psp_div_zero_total(void);
+
 /* Division by zero does not trap on MIPS — HI/LO are simply unpredictable.
  * We define them (quotient -1/0, remainder = dividend) so a recompiled game
  * that hits this is deterministic and diffable against the oracle instead of
@@ -66,6 +78,7 @@ static inline void psp_multu(uint32_t a, uint32_t b) {
 static inline void psp_div(uint32_t a, uint32_t b) {
     int32_t sa = (int32_t)a, sb = (int32_t)b;
     if (sb == 0) {
+        psp_div_by_zero(a, "div");
         psp_cpu.lo = sa < 0 ? 1u : 0xFFFFFFFFu;
         psp_cpu.hi = a;
     } else if (sa == (int32_t)0x80000000 && sb == -1) {
@@ -79,6 +92,7 @@ static inline void psp_div(uint32_t a, uint32_t b) {
 
 static inline void psp_divu(uint32_t a, uint32_t b) {
     if (b == 0) {
+        psp_div_by_zero(a, "divu");
         psp_cpu.lo = 0xFFFFFFFFu;
         psp_cpu.hi = a;
     } else {

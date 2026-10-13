@@ -25,6 +25,7 @@
  * les premiers, on compte les suivants, et les totaux restent lisibles a la fin.
  */
 #include "psprecomp/recomp_rt.h"
+#include "psprecomp/dispatch.h"
 
 #include <stdio.h>
 
@@ -34,6 +35,8 @@ static uint64_t g_syscall_total;
 static uint64_t g_unimplemented_total;
 static uint32_t g_syscall_logged;
 static uint32_t g_unimplemented_logged;
+static uint64_t g_div_zero_total;
+static uint32_t g_div_zero_logged;
 
 void psp_syscall(uint32_t id) {
     if (g_syscall_logged < PSP_TRAP_LOGGED) {
@@ -52,14 +55,32 @@ void psp_unimplemented(uint32_t addr, const char *what) {
     g_unimplemented_total++;
 }
 
+/* Une division par zero n'est pas un piege ici : le runtime definit HI/LO, donc
+ * le jeu prend la valeur et continue, et rien dans son comportement ne dit
+ * qu'une division par zero a eu lieu. C'est le seul endroit ou le dire -- et ce
+ * que coute l'evenement se paie loin de sa cause. */
+void psp_div_by_zero(uint32_t dividend, const char *what) {
+    if (g_div_zero_logged < PSP_TRAP_LOGGED) {
+        g_div_zero_logged++;
+        fprintf(stderr,
+                "psprecomp: %s by zero (dividend 0x%08X) at fn 0x%08X -- HI/LO "
+                "are a choice of this runtime, not of the machine\n",
+                what ? what : "divide", dividend, psp_trace_last());
+    }
+    g_div_zero_total++;
+}
+
 uint64_t psp_syscall_total(void)       { return g_syscall_total; }
 uint64_t psp_unimplemented_total(void) { return g_unimplemented_total; }
+uint64_t psp_div_zero_total(void)      { return g_div_zero_total; }
 
 /* Un hote qui veut mesurer avant/apres une correction remet les compteurs a
  * zero, plutot que de comparer des totaux cumules depuis le demarrage. */
 void psp_trap_reset(void) {
     g_syscall_total = 0;
     g_unimplemented_total = 0;
+    g_div_zero_total = 0;
     g_syscall_logged = 0;
     g_unimplemented_logged = 0;
+    g_div_zero_logged = 0;
 }
