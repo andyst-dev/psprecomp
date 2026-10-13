@@ -139,6 +139,11 @@ static void warn_block(const char *what) {
 
 /* ---- threads ------------------------------------------------------------- */
 
+/* Threads are few per run, so every one is named rather than counted silently:
+ * "was the worker ever started?" is the question that decides whether a wait
+ * can end at all, and a driver that only reports a total cannot answer it. */
+static uint64_t g_created, g_started;
+
 static void hle_CreateThread(void) {
     /* (name, entry, priority, stackSize, attr, option) */
     psp_thread *t = NULL;
@@ -161,6 +166,9 @@ static void hle_CreateThread(void) {
     t->uid = g_next_uid++;
     t->state = TH_DORMANT;
     t->used = 1;
+    g_created++;
+    fprintf(stderr, "thread %u created : entry 0x%08X stack %u  (%s)\n",
+            t->uid, t->entry, t->stack_size, t->name);
     psp_ret(t->uid);
 }
 
@@ -186,6 +194,8 @@ static void hle_StartThread(void) {
 
     t->state = TH_RUNNING;
     g_current = t;
+    g_started++;
+    fprintf(stderr, "thread %u started : entry 0x%08X\n", t->uid, t->entry);
 
     if (setjmp(t->unwind) == 0) {
         t->unwind_set = 1;
@@ -196,6 +206,11 @@ static void hle_StartThread(void) {
      * unwound out of the thread; exit_status was recorded there. */
     t->unwind_set = 0;
     t->state = TH_DORMANT;
+    /* Where it ended, not just that it did. A thread body that returns early
+     * leaves the flag it was supposed to arm unset, and the address is what
+     * says whether it finished or simply fell out somewhere. */
+    fprintf(stderr, "thread %u ended   : status 0x%08X, last fn 0x%08X\n",
+            t->uid, t->exit_status, psp_trace_last());
 
     g_current = prev;
     psp_cpu = saved;
@@ -406,6 +421,9 @@ static void hle_CreateCallback(void) {
      * case -- exit and power callbacks) is unaffected. */
     psp_ret(c->uid);
 }
+
+uint64_t psp_threadman_created(void) { return g_created; }
+uint64_t psp_threadman_started(void) { return g_started; }
 
 void psp_threadman_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every

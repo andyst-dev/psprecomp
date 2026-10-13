@@ -153,6 +153,13 @@ void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
 
+/* How many threads were created and how many were actually started. The gap
+ * between the two is the first thing to look at when a game waits on a flag
+ * nothing ever arms: a created-but-never-started worker explains it exactly,
+ * and no other instrument shows the difference. */
+uint64_t psp_threadman_created(void);
+uint64_t psp_threadman_started(void);
+
 /* Bytes of user memory still available — the cheapest end-to-end check that
  * the allocator is behaving. */
 uint32_t psp_sysmem_free(void);
