@@ -125,16 +125,18 @@ static void hle_SetFrameBuf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* There is no scanout, so a vblank wait returns immediately and bumps the
- * counter. A game's main loop is usually `render(); WaitVblank();`, which
- * means this counter is the frame number -- the most useful single number to
- * have during bring-up, because it tells you whether the game is looping or
- * stuck. */
+/* There is no scanout, so a vblank wait does not wait for one: it bumps the
+ * counter and gives the CPU away. A game's main loop is usually
+ * `render(); WaitVblank();`, which means this counter is the frame number --
+ * the most useful single number to have during bring-up, because it tells you
+ * whether the game is looping or stuck -- and the yield is what lets the
+ * threads that feed that loop run. */
 static void hle_WaitVblank(void) {
     g_vblank_count++;
     /* A frame boundary is the guest asking for time to pass, so it is the third
-     * point where an interrupt is delivered (src/hle/intrman.c). */
-    psp_intr_tick();
+     * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
+     * CPU, the most natural place to hand the CPU over. */
+    psp_threadman_frame_wait();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

@@ -255,6 +255,12 @@ static void hle_Printf(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* How much can still be handed out, and how much was ever free. A game asks
+ * these to decide whether it can allocate at all, so a stubbed zero is the
+ * worst possible answer: it reads as "the heap is empty" and sends the game
+ * down its out-of-memory path while the memory is right there. */
+static void hle_MaxFreeMemSize(void) { psp_ret(psp_sysmem_free()); }
+
 void psp_sysmem_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below, so a mistyped NID cannot survive. */
@@ -264,4 +270,5 @@ void psp_sysmem_register(void) {
     psp_hle_register(0x7591C7DB, "SysMemUserForUser", "sceKernelSetCompiledSdkVersion",hle_SetCompiledSdkVersion);
     psp_hle_register(0xF77D77CB, "SysMemUserForUser", "sceKernelSetCompilerVersion",   hle_SetCompilerVersion);
     psp_hle_register(0x13A5ABEF, "SysMemUserForUser", "sceKernelPrintf",               hle_Printf);
+    psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
 }

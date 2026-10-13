@@ -163,7 +163,7 @@ It does not yet render. Being specific about which parts are real:
 | **VFPU** | 🔨 Partial | Arithmetic, matrix ops, constants, immediates, prefixes. 108 of 137,748 instructions still trap (0.08%) |
 | **HLE firmware** | 🔨 Partial | 112 registrations across sysmem, threadman, GE, display, sascore, io, ctrl. Every NID verified against SHA-1 of its own name |
 | **GE rasterizer** | 🔨 Partial | Triangles, strips, sprites in through-mode; six tests assert *where* pixels land. Transformed geometry counted, not drawn |
-| **Threading** | ❌ Not started | Run-to-completion only; no scheduler |
+| **Threading** | ✅ Works | One host thread per guest thread, one CPU handed over explicitly; blocking waits, wakeups, semaphores, event flags, callbacks and variable pools |
 | **A game on screen** | ❌ Not yet | The flagship reaches its allocator and stalls in start-up. See [BRINGUP.md](docs/BRINGUP.md) |
 
 ### Bring-up instruments

@@ -23,8 +23,14 @@
  *
  * There is no timer and no preemption, so there is nothing to interrupt *from*.
  * An interrupt is therefore delivered at the points where the guest itself asks
- * for time to pass: SleepThread, DelayThread and the vblank wait. One wait, one
- * delivery, handlers in registration order, enabled ones only.
+ * for time to pass: SleepThread, DelayThread, the vblank wait, and every tick a
+ * blocked thread spends parked. One wait, one delivery, handlers in registration
+ * order, enabled ones only.
+ *
+ * A critical section is respected: a thread that has called
+ * sceKernelCpuSuspendIntr gets no delivery until it resumes, because the flag
+ * the handlers arm is written inside one of those brackets. The mask is
+ * per-thread and lives in the scheduler (src/hle/threadman.c).
  *
  * That is a coarse model, and it is the honest one. It is also the model that
  * lets a *polling* game advance, which the alternative cannot: returning from
@@ -133,6 +139,10 @@ void psp_intr_tick(void) {
      * serviced is simply serviced later, which is what the flag being set
      * achieves anyway. */
     if (g_delivering) return;
+    /* Inside a critical section, the guest has said that what it is doing
+     * cannot be disturbed -- and what the handlers arm is written inside one
+     * of those brackets. */
+    if (psp_threadman_intr_disabled()) return;
     g_delivering = 1;
 
     for (int i = 0; i < MAX_SUBINTR; i++) {

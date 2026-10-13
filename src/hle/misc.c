@@ -14,21 +14,18 @@
 #include <time.h>
 
 /* ---- Kernel_Library ------------------------------------------------------
- * Interrupt masking. With no interrupts to mask, the pair only has to be
- * *consistent*: suspend returns a cookie that resume accepts. Games use them
- * to bracket short critical sections, and libc's lightweight mutexes are built
- * on them -- which is why a game stalls in its own startup without these. */
-
-static uint32_t g_intr_enabled = 1;
+ * Interrupt masking. The mask belongs to the *thread* that opened the critical
+ * section, not to the machine: with several guest threads on one CPU, a global
+ * flag would let one thread's suspend silence interrupts inside another
+ * thread's unrelated bracket. The scheduler owns that state, because it is
+ * also what decides whether an interrupt may be delivered at a park. */
 
 static void hle_CpuSuspendIntr(void) {
-    uint32_t prev = g_intr_enabled;
-    g_intr_enabled = 0;
-    psp_ret(prev);                    /* the cookie resume expects */
+    psp_ret((uint32_t)psp_threadman_intr_suspend());   /* the cookie resume expects */
 }
 
 static void hle_CpuResumeIntr(void) {
-    g_intr_enabled = psp_arg(0);
+    psp_threadman_intr_resume(psp_arg(0));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -192,7 +189,8 @@ static void hle_Output(void) {
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
 
 void psp_misc_reset(void) {
-    g_intr_enabled = 1;
+    /* The interrupt mask is per thread and lives in the scheduler; a reset
+     * here cannot reach another thread's bracket, and should not. */
     g_exit_requested = 0;
     g_buttons = 0;
     g_analog_x = g_analog_y = 128;

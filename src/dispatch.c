@@ -99,7 +99,11 @@ psp_fn_t psp_lookup(uint32_t addr) {
 
 /* ---- function-entry trace ------------------------------------------------ */
 
-#define TRACE_DEPTH 32
+/* Deep enough to hold a whole initialisation chain. 32 was chosen for a
+ * single-threaded bring-up where the interesting chain was short; a module
+ * that walks a table of 100 initialisers runs far deeper than that, and the
+ * entry it is stuck in falls out of the window exactly when it is needed. */
+#define TRACE_DEPTH 4096
 static uint32_t g_trace[TRACE_DEPTH];
 static uint64_t g_trace_n;
 
