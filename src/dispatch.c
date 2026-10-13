@@ -190,10 +190,15 @@ void psp_dispatch(uint32_t addr) {
     if (fn) {
         /* Log the first few *successful* indirect calls. Every session so far
          * has examined only the failures; a working virtual call sitting next
-         * to a broken one says where vptrs come from. */
+         * to a broken one says where vptrs come from.
+         *
+         * 400 rather than a dozen, because the interesting sequence is often a
+         * table walk: a module that calls its initialisers through the table
+         * makes a hundred indirect calls in a row, and the entry it stops at
+         * is the last line -- which twelve lines never reach. */
         extern int psp_log_indirect;
         static int logged;
-        if (psp_log_indirect && logged < 12) {
+        if (psp_log_indirect && logged < 400) {
             logged++;
             fprintf(stderr, "indirect ok: target=0x%08X from fn 0x%08X\n",
                     addr, psp_trace_last());
