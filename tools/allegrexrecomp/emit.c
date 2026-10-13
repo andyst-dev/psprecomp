@@ -676,16 +676,39 @@ static void emit_function(ectx *c, const a_func *fn) {
                  * so a jump there would run the continuation at the wrong time. */
                 uint32_t cont = a;
                 while (cont < fn->end && !owned_by(an, cont, owner)) cont += 4;
-                int can_fall_out = 1;
-                if (cont >= 4 && cont <= fn->end) {
-                    a_insn fi;
-                    a_decode(fetch(an, cont - 4), cont - 4, &fi);
-                    can_fall_out = !(fi.is_return || fi.is_indirect ||
-                                     (fi.is_jump && !fi.is_call));
+                /* Does the flow leave the function *inside* the gap?
+                 *
+                 * The gap is not opaque: the hardware runs through it address by
+                 * address, and only reaches the continuation if nothing in the
+                 * gap transfers control away. A shared epilogue is the case that
+                 * matters -- the tail of a function is routinely owned by
+                 * another body, and it ends in `jr $ra`, so the continuation
+                 * after it is *dead code* for this body.
+                 *
+                 * Checking only the last address of the gap is not enough, and
+                 * the difference is measurable. On LocoRoco, the 64-bit helpers
+                 * of libgcc fall out of 0x2DE54 into 0x2DE58, whose body is the
+                 * shared epilogue (0x2DE5C: `lw $s1`, `lw $s0`, `v0 = $a0`,
+                 * `v1 = $a2`, `jr $ra` at 0x2DE6C). The last address of that gap
+                 * is the delay slot of the `jr` (`addiu $sp, $sp, 16`), which is
+                 * not a terminator -- so the jump to the continuation at 0x2DE74
+                 * was emitted, __udivdi3/__umoddi3 continued past a `jr $ra` and
+                 * returned 0, and every 64-bit division in the game produced
+                 * garbage. Measured on the probe: 24/24 correct with the walk
+                 * below, 9/24 without it. */
+                int reaches_cont = 1;
+                for (uint32_t x = a; x < cont; x += 4) {
+                    a_insn gi;
+                    a_decode(fetch(an, x), x, &gi);
+                    if (gi.is_return || (gi.is_indirect && !gi.is_call) ||
+                        (gi.is_jump && !gi.is_call)) {
+                        reaches_cont = 0;
+                        break;
+                    }
                 }
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
                 emit_static_call(c, a);
-                if (cont < fn->end && can_fall_out && c->is_label[widx(an, cont)])
+                if (cont < fn->end && reaches_cont && c->is_label[widx(an, cont)])
                     fprintf(f, "    goto L_%08X;   /* the fragment's fall-out lands here */\n", cont);
                 else
                     fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
