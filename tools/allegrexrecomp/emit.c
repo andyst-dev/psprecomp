@@ -797,7 +797,23 @@ static void emit_function(ectx *c, const a_func *fn) {
                 }
             }
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
-            a += 4;                              /* consumed the delay slot */
+            /* A delay slot is consumed here only when this body emitted it.
+             *
+             * When the slot belongs to another body it is not emitted inline,
+             * and skipping it anyway moved the walk one instruction past the
+             * address control actually reaches: the body's `end` then points at
+             * whatever follows the slot, which is routinely neither a function
+             * entry nor a label, so the fall-out was emitted as nothing -- a
+             * silent `return`. A body that stops early usually still holds a
+             * frame that only the continuation pops, so the caller resumes with
+             * the wrong $sp and reads a plausible wrong value from it.
+             *
+             * Measured on LocoRoco (UCES00304): 0x1003C is a `beq` whose slot at
+             * 0x10040 begins the body of the next function, so the body of
+             * 0x10038 ended in that silent return. Ten negative stack imbalance
+             * sites, -192..-16, in the 0xF4xx..0x16Axx region all traced back to
+             * it, and a run that reported them now reports none. */
+            if (have_slot) a += 4;               /* consumed the delay slot */
             continue;
         }
 
@@ -821,7 +837,7 @@ static void emit_function(ectx *c, const a_func *fn) {
             if (in.is_indirect) fprintf(f, "    psp_dispatch(%s);\n", RN[in.rs]);
             else                emit_static_call(c, in.target);
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
-            a += 4;
+            if (have_slot) a += 4;               /* see the branch case above */
             continue;
         }
 
