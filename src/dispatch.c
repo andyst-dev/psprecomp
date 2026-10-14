@@ -329,14 +329,82 @@ int psp_trace_was_marked(uint32_t addr) {
  * Checking the invariant at every return finds the culprit directly.
  *
  * The two signs are not the same thing, and only one of them is a bug. A
- * *positive* delta is what a split continuation reports: a body that holds an
+ * positive* delta is what a split continuation reports: a body that holds an
  * epilogue but not its matching prologue, which discovery makes a separate
  * body, so the invariant does not hold for it. A *negative* delta is stack
  * consumed and never returned, and that is the one that poisons everything
  * downstream. Counting them together buries the second under the first -- a run
  * on LocoRoco reached 549 million violations of which the informative part was
  * a handful -- so the first leak is named, with its $sp, the entry it expected
- * and the last function entered, and the two counts stay separate. */
+ * and the last function entered, and the two counts stay separate.
+ *
+ * The message cap is a second trap, and it bites in the other direction: the
+ * log stops after a dozen lines, so "no large delta in the log" reads as "no
+ * large delta" when it only means "the log stopped". The table below keeps
+ * every distinct (site, delta) pair with its count and keeps the largest
+ * magnitude seen even when the table is full, so one line of report names the
+ * biggest imbalance whatever the volume. Measured on LocoRoco: the printed
+ * lines were all +16/+32/+48 while the interesting shift was elsewhere. */
+#define PSP_SP_SITES 96
+
+typedef struct {
+    uint32_t site;      /* fn (body check) or callee (call check) */
+    int32_t  delta;
+    uint64_t count;
+    uint32_t in;        /* $sp expected / $sp before the call */
+    uint32_t out;       /* $sp observed / $sp after the call */
+    uint32_t last;      /* last function entered (body checks) */
+} sp_row;
+
+typedef struct { sp_row rows[PSP_SP_SITES]; int n; sp_row worst; } sp_table;
+
+static sp_table g_sp_tbl, g_spc_tbl;
+
+static int64_t sp_mag(int32_t d) { return d < 0 ? -(int64_t)d : (int64_t)d; }
+
+static void sp_record(sp_table *t, uint32_t site, int32_t d,
+                      uint32_t in, uint32_t out, uint32_t last) {
+    sp_row r = { site, d, 1, in, out, last };
+    if (t->worst.count == 0 || sp_mag(d) > sp_mag(t->worst.delta)) t->worst = r;
+    for (int i = 0; i < t->n; i++)
+        if (t->rows[i].site == site && t->rows[i].delta == d) {
+            t->rows[i].count++;
+            return;
+        }
+    if (t->n < PSP_SP_SITES) { t->rows[t->n++] = r; return; }
+    /* Table full: evict the smallest magnitude, so a report that cannot hold
+     * everything still holds the part that matters. */
+    int victim = 0;
+    for (int i = 1; i < t->n; i++)
+        if (sp_mag(t->rows[i].delta) < sp_mag(t->rows[victim].delta)) victim = i;
+    if (sp_mag(d) > sp_mag(t->rows[victim].delta)) t->rows[victim] = r;
+}
+
+/* Largest magnitude first: the report reads the story, not the arrival order. */
+static int sp_dump(const sp_table *t, psp_sp_site *out, int max) {
+    int n = t->n < max ? t->n : max;
+    int used[PSP_SP_SITES];
+    for (int i = 0; i < t->n; i++) used[i] = 0;
+    for (int k = 0; k < n; k++) {
+        int best = -1;
+        for (int i = 0; i < t->n; i++) {
+            if (used[i]) continue;
+            if (best < 0 || sp_mag(t->rows[i].delta) > sp_mag(t->rows[best].delta)) best = i;
+        }
+        used[best] = 1;
+        out[k].site  = t->rows[best].site;
+        out[k].delta = t->rows[best].delta;
+        out[k].count = t->rows[best].count;
+        out[k].in    = t->rows[best].in;
+        out[k].out   = t->rows[best].out;
+        out[k].last  = t->rows[best].last;
+    }
+    return n;
+}
+
+int psp_sp_hist(psp_sp_site *out, int max)      { return sp_dump(&g_sp_tbl, out, max); }
+int psp_sp_call_hist(psp_sp_site *out, int max) { return sp_dump(&g_spc_tbl, out, max); }
+
 static uint64_t g_sp_bad;
 static uint64_t g_sp_leaks;
 static uint32_t g_sp_first;
@@ -346,6 +414,7 @@ static uint32_t g_sp_first_in, g_sp_first_out, g_sp_first_last;
 void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
     if (sp_in == sp_out) return;
     int32_t d = (int32_t)(sp_out - sp_in);
+    sp_record(&g_sp_tbl, fn, d, sp_in, sp_out, psp_trace_last());
     if (g_sp_bad < 24)
         fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn, (int)d,
                 d < 0 ? "   <-- leak" : "");
@@ -380,6 +449,8 @@ uint32_t psp_sp_first_last(void) { return g_sp_first_last; }
 static uint64_t g_spc_bad;
 void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after) {
     if (sp_before == sp_after) return;
+    sp_record(&g_spc_tbl, callee, (int32_t)(sp_after - sp_before),
+              sp_before, sp_after, psp_trace_last());
     if (g_spc_bad < 16)
         fprintf(stderr, "sp NOT RESTORED by callee 0x%08X: %+d\n",
                 callee, (int)(sp_after - sp_before));

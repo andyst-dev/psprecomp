@@ -72,6 +72,23 @@ int32_t  psp_sp_first_delta(void);
 uint32_t psp_sp_first_in(void);
 uint32_t psp_sp_first_out(void);
 uint32_t psp_sp_first_last(void);
+/* Desequilibres de pile groupes par site, |delta| decroissant : la FORME du
+ * bruit, et non ses premiers messages -- un plafond par message fait lire
+ * « pas de gros ecart » la ou il faut lire « le journal s'est arrete ». La
+ * table retient chaque couple (site, delta) distinct, et le plus grand |delta|
+ * meme quand elle est pleine. `site` est la fonction du controle de corps, ou
+ * le callee du controle d'appel. */
+typedef struct {
+    uint32_t site;
+    int32_t  delta;
+    uint64_t count;
+    uint32_t in;        /* $sp attendu / avant l'appel */
+    uint32_t out;       /* $sp observe / apres l'appel */
+    uint32_t last;      /* derniere fonction entree (controles de corps) */
+} psp_sp_site;
+
+int psp_sp_hist(psp_sp_site *out, int max);
+int psp_sp_call_hist(psp_sp_site *out, int max);
 void psp_trace_watch_label(uint32_t addr, void (*fn)(uint32_t));
 void psp_trace_marks_init(uint32_t lo, uint32_t words);
 int psp_trace_was_marked(uint32_t addr);
