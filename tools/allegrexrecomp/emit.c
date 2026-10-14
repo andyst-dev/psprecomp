@@ -93,10 +93,13 @@ static void comment(ectx *c, const a_insn *in) {
     fprintf(c->out, "    /* %08X  %s */\n", in->addr, text);
 }
 
-/* Emit a call to whatever lives at a static target. */
-static void emit_static_call(ectx *c, uint32_t target) {
+/* Emit a call to whatever lives at a static target, without the surrounding
+ * block. Split out so a caller that already owns a block (a branch that leaves
+ * the function through the call) gets the same table lookup and the same
+ * stack observation, instead of a third hand-rolled copy of the three cases. */
+static void emit_static_call_inline(ectx *c, uint32_t target) {
     if (is_import(c->an, target)) {
-        fprintf(c->out, "    psp_import_%08X();\n", target);
+        fprintf(c->out, "psp_import_%08X();", target);
     } else if (is_function(c->an, target)) {
         /* Check the stack across the call. A callee that consumes stack and
          * does not return it corrupts every callee-saved register its caller
@@ -104,13 +107,35 @@ static void emit_static_call(ectx *c, uint32_t target) {
          * at the call site catches it wherever the imbalance actually occurs --
          * including across split bodies, where no single body owns both halves
          * of a frame and a per-body check is blind. */
-        fprintf(c->out, "    { uint32_t _spc = r_sp; psp_func_%08X();"
-                        " PSP_SP_CALL(0x%08Xu, _spc, r_sp); }\n", target, target);
+        fprintf(c->out, "uint32_t _spc = r_sp; psp_func_%08X();"
+                        " PSP_SP_CALL(0x%08Xu, _spc, r_sp);", target, target);
     } else {
         /* Discovery did not reach it. Going through the dispatch table means
          * the failure is named at run time instead of failing to link. */
-        fprintf(c->out, "    psp_dispatch(0x%08Xu);  /* not discovered */\n", target);
+        fprintf(c->out, "psp_dispatch(0x%08Xu);  /* not discovered */", target);
     }
+}
+
+/* Emit a call to whatever lives at a static target.
+ *
+ * Only the function case is wrapped in a block, because it declares a local for
+ * the stack observation; the other two are emitted bare, exactly as they were
+ * before this was split out. That way re-emitting after the change is
+ * byte-identical everywhere the observation is not actually new, and the diff
+ * is the measurement. */
+static void emit_static_call(ectx *c, uint32_t target) {
+    /* Import first, exactly as the inline helper does: a stub address can sit in
+     * both tables, and when it does the import must win in both -- wrapping the
+     * import path would have changed 264 unrelated lines of the emission. */
+    if (!is_import(c->an, target) && is_function(c->an, target)) {
+        fprintf(c->out, "    { ");
+        emit_static_call_inline(c, target);
+        fprintf(c->out, " }\n");
+        return;
+    }
+    fprintf(c->out, "    ");
+    emit_static_call_inline(c, target);
+    fprintf(c->out, "\n");
 }
 
 /* ---- one non-control-flow instruction ------------------------------------ */
@@ -532,14 +557,23 @@ static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_t
 
 /* ---- one function -------------------------------------------------------- */
 
-static void emit_function(ectx *c, const a_func *fn) {
+/* Which owned addresses are branch targets, and which are consumed as delay
+ * slots.
+ *
+ * Run for every function before any body is emitted, and again for the function
+ * being emitted (the second run marks nothing new -- marking is monotone).
+ *
+ * This has to be module-wide because the map is read from *other* bodies: a
+ * body whose last instruction falls through asks whether the address after it
+ * is reachable by name, and that address may belong to a body emitted far
+ * later. Measured on LocoRoco: 0x3B2A8 falls into 0x3B2B0, a label of
+ * psp_body_0003B8F8 -- a backward jump pulls that block below the entry, so the
+ * owner is emitted after it -- and with the marking done per body alone the
+ * test saw "no label" and the continuation was never emitted. */
+static void mark_labels(ectx *c, const a_func *fn) {
     const a_analysis *an = c->an;
-    FILE *f = c->out;
     const uint32_t owner = fn->addr;
 
-    /* Pass 1: which owned addresses are branch targets, and which are consumed
-     * as delay slots. A delay slot is emitted inline with its branch, so the
-     * main pass must skip it. */
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner)) continue;
         a_insn in;
@@ -568,6 +602,17 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (c->is_slot[i] && c->is_label[i] && owned_by(an, a + 4, owner))
             c->is_label[widx(an, a + 4)] = 1;
     }
+}
+
+static void emit_function(ectx *c, const a_func *fn) {
+    const a_analysis *an = c->an;
+    FILE *f = c->out;
+    const uint32_t owner = fn->addr;
+
+    /* Pass 1: the label and delay-slot map. Already complete for the whole
+     * module by the time this runs; repeated here because marking is monotone
+     * and a body that reaches this point must never depend on the order. */
+    mark_labels(c, fn);
 
     fprintf(f, "\n/* ---------------------------------------------------------------\n");
     fprintf(f, " * psp_func_%08X  --  %u instructions, %u bytes\n",
@@ -674,44 +719,9 @@ static void emit_function(ectx *c, const a_func *fn) {
                  * fragment that ends in `jr`/`j` never falls through, and its
                  * internal `jr $ra` reaches the caller through the same C call,
                  * so a jump there would run the continuation at the wrong time. */
-                uint32_t cont = a;
-                while (cont < fn->end && !owned_by(an, cont, owner)) cont += 4;
-                /* Does the flow leave the function *inside* the gap?
-                 *
-                 * The gap is not opaque: the hardware runs through it address by
-                 * address, and only reaches the continuation if nothing in the
-                 * gap transfers control away. A shared epilogue is the case that
-                 * matters -- the tail of a function is routinely owned by
-                 * another body, and it ends in `jr $ra`, so the continuation
-                 * after it is *dead code* for this body.
-                 *
-                 * Checking only the last address of the gap is not enough, and
-                 * the difference is measurable. On LocoRoco, the 64-bit helpers
-                 * of libgcc fall out of 0x2DE54 into 0x2DE58, whose body is the
-                 * shared epilogue (0x2DE5C: `lw $s1`, `lw $s0`, `v0 = $a0`,
-                 * `v1 = $a2`, `jr $ra` at 0x2DE6C). The last address of that gap
-                 * is the delay slot of the `jr` (`addiu $sp, $sp, 16`), which is
-                 * not a terminator -- so the jump to the continuation at 0x2DE74
-                 * was emitted, __udivdi3/__umoddi3 continued past a `jr $ra` and
-                 * returned 0, and every 64-bit division in the game produced
-                 * garbage. Measured on the probe: 24/24 correct with the walk
-                 * below, 9/24 without it. */
-                int reaches_cont = 1;
-                for (uint32_t x = a; x < cont; x += 4) {
-                    a_insn gi;
-                    a_decode(fetch(an, x), x, &gi);
-                    if (gi.is_return || (gi.is_indirect && !gi.is_call) ||
-                        (gi.is_jump && !gi.is_call)) {
-                        reaches_cont = 0;
-                        break;
-                    }
-                }
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
                 emit_static_call(c, a);
-                if (cont < fn->end && reaches_cont && c->is_label[widx(an, cont)])
-                    fprintf(f, "    goto L_%08X;   /* the fragment's fall-out lands here */\n", cont);
-                else
-                    fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
+                fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n    return;\n", a);
                 last_terminal = 1;
             }
             continue;
@@ -771,10 +781,18 @@ static void emit_function(ectx *c, const a_func *fn) {
                     { if (in.target <= a) fprintf(f, "      if (_c) PSP_LOOP(0x%08Xu);\n", in.target);
                       fprintf(f, "      if (_c) goto L_%08X; }\n", in.target); }
                 else {
+                    /* A branch that leaves the function through the call: the
+                     * body ends mid-frame and the callee runs the rest, so the
+                     * body's own check is not the right observation there -- but
+                     * the callee still owes back the stack it borrowed, and that
+                     * is exactly what PSP_SP_CALL states. Emitting this call
+                     * unsigned left the whole family invisible: measured on
+                     * LocoRoco, a branch to a shared continuation (0x3B924
+                     * `bltz $v0, 0x3A00C`) returned with $sp 656 bytes low, and
+                     * only the fall-out path -- which does carry the check --
+                     * ever reported it, once, attributed to the other site. */
                     fprintf(f, "      if (_c) { ");
-                    if (is_import(an, in.target))      fprintf(f, "psp_import_%08X();", in.target);
-                    else if (is_function(an, in.target)) fprintf(f, "psp_func_%08X();", in.target);
-                    else                                fprintf(f, "psp_dispatch(0x%08Xu);", in.target);
+                    emit_static_call_inline(c, in.target);
                     fprintf(f, " return; } }\n");
                 }
             }
@@ -859,13 +877,44 @@ static void emit_function(ectx *c, const a_func *fn) {
      * how it surfaced -- reach went *down* while every other measure improved.
      *
      * So if the last instruction emitted could fall through, and the address
-     * after this function is another function's entry, continue there. */
+     * after this function is another function's entry, continue there.
+     *
+     * The address after the function is not always a function entry, though,
+     * and the other two cases were left silent. The common one on a real module
+     * is an interior label of another body: measured on LocoRoco, 605 bodies end
+     * that way. It is the same defect with a worse symptom, because a body that
+     * stops early usually still holds a frame that only the shared epilogue pops.
+     * Concretely: the case at 0x3B2AC of a 656-byte-frame state machine falls
+     * into 0x3B2B0, a label inside psp_body_0003B8F8; the silent return left the
+     * 656 bytes pushed, 0x3B2A8 is the last function entered when $s5 is read
+     * back as 0xFFFFFFFF from a $sp that is 656 low, and the run dies on
+     * `jalr $s5`. Continuing there is what the hardware does, and the thunk
+     * already exists -- the same one an indirect jump to a label uses.
+     *
+     * Anything else is dispatched: that resolves a registered label, and
+     * otherwise it names a miss at run time instead of returning in silence. */
     if (!last_terminal) {
         uint32_t next = fn->end;
         if (is_function(an, next)) {
             fprintf(f, "    /* falls through into the next function */\n");
             fprintf(f, "    psp_func_%08X();\n", next);
+        } else if (next < an->base + an->size &&
+                   an->owner[widx(an, next)] != A_NO_OWNER &&
+                   !c->is_slot[widx(an, next)] && c->is_label[widx(an, next)]) {
+            /* A thunk exists for exactly this: a label another body owns, that
+             * is not a delay slot, gets both a `case` in that body's entry
+             * switch and a psp_at_ wrapper of its own -- the same wrapper an
+             * indirect jump to that label resolves to. */
+            fprintf(f, "    /* falls through into 0x%08X, a label of another body */\n", next);
+            fprintf(f, "    psp_at_%08X();\n", next);
         }
+        /* The remaining case is emitted as nothing, i.e. today's silent return:
+         * the address after the body is data (a `.word` tail) or code no body
+         * claimed. Dispatching there instead was measured to stop the run
+         * EARLIER -- 1605 sites, and the boot path's initialiser walk fell from
+         * entry [99] to entry [9] -- so it is left alone here: the honest fix is
+         * to make those addresses reachable by name, not to announce them as a
+         * miss from this line. */
     }
     fprintf(f, "}\n");
 
@@ -1039,6 +1088,31 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     if (!c.is_label || !c.is_slot) {
         free(c.is_label); free(c.is_slot); fclose(f);
         return -1;
+    }
+
+    /* The label map is module-wide and complete before the first body is
+     * emitted: a body's last instruction can fall through into a label that
+     * belongs to a body emitted later. */
+    for (int i = 0; i < an->nfuncs; i++) mark_labels(&c, &an->funcs[i]);
+
+    /* Forward declarations for the interior-label thunks.
+     *
+     * A body can fall out into a label of a body emitted later, so the thunk it
+     * calls is defined hundreds of thousands of lines further down the file.
+     * Without these, C99 rejects the call -- "call to undeclared function
+     * psp_at_...", 20 errors and no object file -- which is how this was found:
+     * the fall-out continuation produced a generated file that did not compile.
+     * The set is exactly the one the per-body thunk loop emits, and the
+     * module-wide label map is what makes it computable before any body. */
+    fprintf(f, "/* Entry thunks for interior labels: a body can fall out into a\n"
+               " * label that is defined later in this file. */\n");
+    for (int i = 0; i < an->nfuncs; i++) {
+        const a_func *fn = &an->funcs[i];
+        for (uint32_t a = fn->start; a < fn->end; a += 4) {
+            if (!owned_by(an, a, fn->addr) || !c.is_label[widx(an, a)]) continue;
+            if (c.is_slot[widx(an, a)] || a == fn->addr) continue;
+            fprintf(f, "void psp_at_%08X(void);\n", a);
+        }
     }
 
     for (int i = 0; i < an->nfuncs; i++) {
