@@ -755,9 +755,14 @@ static void emit_function(ectx *c, const a_func *fn) {
                 fprintf(f, "    /* falls into 0x%08X, owned by another function */\n", a);
                 /* This body's own balance, checked before the transfer: after
                  * it, the check would cost the frame the transfer must not
-                 * need. A fall-out leaves $sp mid-frame by design, so what it
-                 * reports is a body that unwound too much, not too little. */
-                fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n", a);
+                 * need, and the balance of the body being entered is its own
+                 * business -- it checks that at its own exits.
+                 *
+                 * The invariant here is not the one at a `jr $ra`. A fall-out
+                 * hands over mid-frame by design, so PSP_SP_LEAVE reads the two
+                 * signs the other way round: the frame is expected, a hand-over
+                 * above the entry is the defect. */
+                fprintf(f, "    PSP_SP_LEAVE(0x%08Xu);\n", a);
                 fprintf(f, "    ");
                 emit_static_call_tail(c, a);
                 fprintf(f, "\n    return;\n");
@@ -1020,6 +1025,7 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
         "#  define PSP_LOOP(a)  psp_trace_loop(a)\n"
         "#  define PSP_SP_ENTER()  uint32_t _sp0 = r_sp\n"
         "#  define PSP_SP_CHECK(a) psp_trace_sp(a, _sp0, r_sp)\n"
+        "#  define PSP_SP_LEAVE(a) psp_trace_sp_leave(a, _sp0, r_sp)\n"
         "#  define PSP_SP_CALL(t,a,b) psp_trace_sp_call(t, a, b)\n"
         "#  define PSP_MARK(a)  psp_trace_mark(a)\n"
         "#else\n"
@@ -1027,6 +1033,7 @@ static void emit_header(FILE *f, const a_analysis *an, const emit_opts *o) {
         "#  define PSP_LOOP(a)  ((void)0)\n"
         "#  define PSP_SP_ENTER()  ((void)0)\n"
         "#  define PSP_SP_CHECK(a) ((void)0)\n"
+        "#  define PSP_SP_LEAVE(a) ((void)0)\n"
         "#  define PSP_SP_CALL(t,a,b) ((void)0)\n"
         "#  define PSP_MARK(a)  ((void)0)\n"
         "#endif\n"

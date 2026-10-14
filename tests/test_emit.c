@@ -71,6 +71,191 @@ static void expect_contains(const char *hay, const char *needle, const char *why
     }
 }
 
+/* Transfers that END a body must be emitted so that the call is the LAST thing
+ * the body does. All three of them -- a fall-out into a gap owned by another
+ * function, a `j` to a function entry, the taken path of a likely branch --
+ * compile to a call followed by `return`, and the C compiler turns that into a
+ * sibling jump only when nothing sits in between. A stack observation placed
+ * after the call costs a host frame per guest transfer instead, so a loop the
+ * hardware runs without ever touching its stack consumes the host stack. The
+ * ordinary-branch and end-of-body paths already emitted bare calls; these
+ * checks exist so the other three sites cannot drift back.
+ */
+
+/* A gap: A branches forward over 0x08804008, which is B's entry, so the
+ * sequential walk of A reaches an address owned by another function and stops
+ * there. A's body therefore ends by transferring into B.
+ *
+ *   08804000  beq  $v0,$zero,0x08804010     A
+ *   08804004  addiu $v0,$v0,1               delay slot
+ *   08804008  jr   $ra                      B
+ *   0880400C  nop
+ *   08804010  jr   $ra                      A's other path
+ *   08804014  nop
+ */
+static const uint32_t GAP_CODE[] = {
+    0x10400003u, 0x24420001u, 0x03E00008u, 0x00000000u,
+    0x03E00008u, 0x00000000u,
+};
+
+/* A `j` out of the body, to a function entry: A transfers at 0x08804000 and
+ * never runs 0x08804008.
+ *
+ *   08804000  j    0x08804010               A
+ *   08804004  lui  $v0,0x1234               delay slot
+ *   08804008  nop
+ *   0880400C  nop
+ *   08804010  jr   $ra                      B
+ *   08804014  nop
+ */
+static const uint32_t JUMP_CODE[] = {
+    0x0A201004u, 0x3C021234u, 0x00000000u, 0x00000000u,
+    0x03E00008u, 0x00000000u,
+};
+
+/* A likely branch out of the body: the taken path transfers to a function
+ * entry, and its delay slot belongs to that path.
+ *
+ *   08804000  bltzl $v0,0x08804020          A
+ *   08804004  addiu $v0,$v0,1               delay slot, taken path
+ *   08804008  jr    $ra                     not-taken path
+ *   0880400C  nop
+ *   08804010  nop
+ *   08804014  nop
+ *   08804018  nop
+ *   0880401C  nop
+ *   08804020  jr    $ra                     B
+ *   08804024  nop
+ */
+static const uint32_t LIKELY_CODE[] = {
+    0x58400007u, 0x24420001u, 0x03E00008u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x03E00008u, 0x00000000u,
+};
+
+static uint8_t synth[sizeof LIKELY_CODE * 4];
+
+/* Discover from `seeds` and emit, returning the generated .c (caller frees). */
+static char *emit_synthetic(const char *prefix, const uint32_t *words, size_t nwords,
+                            const uint32_t *seeds, int nseeds, int *nfuncs_out) {
+    for (size_t i = 0; i < nwords; i++) {
+        synth[i * 4 + 0] = (uint8_t)(words[i]);
+        synth[i * 4 + 1] = (uint8_t)(words[i] >> 8);
+        synth[i * 4 + 2] = (uint8_t)(words[i] >> 16);
+        synth[i * 4 + 3] = (uint8_t)(words[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = synth;
+    an.base = BASE;
+    an.size = (uint32_t)(nwords * 4);
+
+    if (a_discover(&an, (uint32_t *)seeds, nseeds) != 0) {
+        printf("FAIL discovery failed for %s\n", prefix);
+        failures++;
+        a_analysis_free(&an);
+        return NULL;
+    }
+    if (nfuncs_out) *nfuncs_out = an.nfuncs;
+
+    emit_opts o;
+    o.outdir = ".";
+    o.prefix = prefix;
+    o.module = "synthetic";
+    int rc = a_emit(&an, &o);
+    a_analysis_free(&an);
+    if (rc != 0) {
+        printf("FAIL emission failed for %s\n", prefix);
+        failures++;
+        return NULL;
+    }
+
+    char path[128];
+    snprintf(path, sizeof path, "./%s_funcs.c", prefix);
+    return slurp(path, NULL);
+}
+
+/* The transfer must END the body: skip the whitespace that follows the call and
+ * accept only `return;` or the closing brace. Anything else costs a frame. */
+static void expect_tail_transfer(const char *src, const char *call, const char *why) {
+    const char *p = strstr(src, call);
+    if (!p) { printf("FAIL %s\n  no such call emitted: %s\n", why, call); failures++; return; }
+    const char *q = p + strlen(call);
+    while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+    if (strncmp(q, "return;", 7) != 0 && *q != '}') {
+        printf("FAIL %s\n  a statement follows the transfer, so it cannot stay a "
+               "tail jump: %.40s\n", why, q);
+        failures++;
+    }
+}
+
+static void expect_absent(const char *src, const char *needle, const char *why) {
+    if (strstr(src, needle)) {
+        printf("FAIL %s\n  must not be emitted here: %s\n", why, needle);
+        failures++;
+    }
+}
+
+static void check_terminal_transfer_stays_tail(void) {
+    /* --- a gap owned by another function --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 8u };
+        int n = 0;
+        char *src = emit_synthetic("t_gap", GAP_CODE, 6, seeds, 2, &n);
+        CHECK(n == 2, "the gap block discovers two entries, got %d", n);
+        if (src) {
+            expect_tail_transfer(src, "psp_func_08804008();",
+                                 "a fall-out into another function stays a tail jump");
+            expect_absent(src, "PSP_SP_CALL(0x08804008u",
+                          "no stack observation after the fall-out transfer");
+            /* Both labels are 0x08804008 -- the fall-out names its target, and
+             * that target's own `jr $ra` names itself -- so the assertion has to
+             * be scoped to the gap: the judgement between the comment and the
+             * transfer must be the fall-out one. */
+            const char *gap = strstr(src, "/* falls into 0x08804008, owned by another function */");
+            const char *call = strstr(src, "psp_func_08804008();");
+            const char *leave = gap ? strstr(gap, "PSP_SP_LEAVE(0x08804008u);") : NULL;
+            const char *check = gap ? strstr(gap, "PSP_SP_CHECK(0x08804008u);") : NULL;
+            CHECK(gap && leave && call && gap < leave && leave < call,
+                  "the fall-out judges a hand-over, before the transfer");
+            CHECK(!check || check > call,
+                  "a fall-out is not judged as if it were a return");
+            free(src);
+        }
+    }
+
+    /* --- a `j` to a function entry --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 0x10u };
+        int n = 0;
+        char *src = emit_synthetic("t_jump", JUMP_CODE, 6, seeds, 2, &n);
+        CHECK(n == 2, "the jump block discovers two entries, got %d", n);
+        if (src) {
+            expect_tail_transfer(src, "psp_func_08804010();",
+                                 "a `j` to a function entry stays a tail jump");
+            expect_absent(src, "PSP_SP_CALL(0x08804010u",
+                          "no stack observation after the `j` transfer");
+            free(src);
+        }
+    }
+
+    /* --- the taken path of a likely branch --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 0x20u };
+        int n = 0;
+        char *src = emit_synthetic("t_likely", LIKELY_CODE, 10, seeds, 2, &n);
+        CHECK(n == 2, "the likely block discovers two entries, got %d", n);
+        if (src) {
+            expect_tail_transfer(src, "psp_func_08804020();",
+                                 "the taken path of a likely branch stays a tail jump");
+            expect_absent(src, "PSP_SP_CALL(0x08804020u",
+                          "no stack observation on the likely branch's taken path");
+            free(src);
+        }
+    }
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -227,6 +412,8 @@ int main(void) {
         free(vsrc);
     }
     a_analysis_free(&an2);
+
+    check_terminal_transfer_stays_tail();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

@@ -61,6 +61,9 @@ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t));
 void psp_trace_loop(uint32_t addr);
 void psp_trace_mark(uint32_t addr);
 void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
+/* The same observation at a transfer that ends a body, where the expected
+ * direction is inverted: the body hands over mid-frame. */
+void psp_trace_sp_leave(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
 void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after);
 uint64_t psp_sp_call_violations(void);
 uint64_t psp_sp_violations(void);

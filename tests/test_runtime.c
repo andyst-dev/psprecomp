@@ -7,6 +7,7 @@
  */
 
 #include "psprecomp/recomp_rt.h"
+#include "psprecomp/dispatch.h"
 
 #include <stdio.h>
 
@@ -194,6 +195,31 @@ static void test_unaligned(void) {
     psp_mem_free();
 }
 
+/* A fragment that falls out hands over mid-frame, and that is not a leak: the
+ * frame was allocated by the first fragment of the same function and the
+ * epilogue that returns it lives in its last one. Calling it a leak buries the
+ * sign that does matter at such a transfer -- a hand-over with $sp *above* the
+ * entry, which means a frame the fragment never took was released. */
+static void test_stack_handover(void) {
+    uint64_t v = psp_sp_violations();
+
+    psp_trace_sp_leave(0x08804000u, 0x09FFF000u, 0x09FFF000u - 2112u);
+    CHECK(psp_sp_violations() == v, "handing over mid-frame is not a violation");
+
+    psp_trace_sp_leave(0x08804000u, 0x09FFF000u, 0x09FFF000u + 64u);
+    CHECK(psp_sp_violations() == v + 1, "handing over above the entry is a violation");
+
+    v = psp_sp_violations();
+
+    /* The return exit keeps the opposite rule, and both live in the same
+     * counter: a `jr $ra` must restore everything it took. */
+    psp_trace_sp(0x08804000u, 0x09FFF000u, 0x09FFF000u - 16u);
+    CHECK(psp_sp_violations() == v + 1, "a return exit that keeps 16 bytes is a violation");
+
+    psp_trace_sp(0x08804000u, 0x09FFF000u, 0x09FFF000u);
+    CHECK(psp_sp_violations() == v + 1, "a balanced return is not a violation");
+}
+
 int main(void) {
     test_zero_register();
     test_division();
@@ -202,6 +228,7 @@ int main(void) {
     test_bitops();
     test_memory();
     test_unaligned();
+    test_stack_handover();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

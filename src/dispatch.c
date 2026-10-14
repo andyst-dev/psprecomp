@@ -435,6 +435,31 @@ void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
     g_sp_bad++;
 }
 
+/* Stack balance at a transfer that ENDS a body: a fall-out into another
+ * fragment, or a `j` to another function's entry.
+ *
+ * The invariant is not the one at a `jr $ra`. A fragment that falls out hands
+ * over mid-frame: the frame was allocated by the first fragment of the same
+ * original function and the matching epilogue lives in its last one, so $sp is
+ * legitimately *below* this fragment's entry by exactly the frame it allocated.
+ * Measured on LocoRoco: every negative delta reported at a fall-out site is
+ * that frame, returned later in the same function -- 0x1A294 allocates 2112 and
+ * 0x1A380 returns 2112 in its `jr $ra` delay slot, 0x3E4 allocates 64 and
+ * 0x4C4 returns 64. On one run those were 206 reports, and calling them leaks
+ * hid the sign that does mean something here: a fragment that hands over with
+ * $sp *above* its entry released a frame it never took, which is what makes its
+ * predecessor's restores read the wrong slots. */
+void psp_trace_sp_leave(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
+    if (sp_in == sp_out) return;
+    int32_t d = (int32_t)(sp_out - sp_in);
+    if (d < 0) return;                    /* this fragment's own frame: expected */
+    if (g_sp_bad < 24)
+        fprintf(stderr, "sp HANDED OVER HIGH in 0x%08X: %+d   <-- released a frame "
+                        "it never took\n", fn, (int)d);
+    if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = d; }
+    g_sp_bad++;
+}
+
 uint64_t psp_sp_violations(void) { return g_sp_bad; }
 uint64_t psp_sp_leaks(void)      { return g_sp_leaks; }
 uint32_t psp_sp_first_bad(void)  { return g_sp_first; }
