@@ -135,6 +135,60 @@ static const uint32_t LIKELY_CODE[] = {
 
 static uint8_t synth[sizeof LIKELY_CODE * 4];
 
+/* A branch whose delay slot is another function's entry.
+ *
+ * Discovery promoted the slot address to an entry of its own -- a relocation
+ * pointer or a function pointer in a table, which on a real module disagrees
+ * with the analysis often (7 525 .sym boundaries for a game that analysis alone
+ * splits into 3 637 functions). So this body does not own the slot and cannot
+ * emit it inline; the walk reaches it by falling through instead, which covers
+ * the NOT-taken path only. A branch delays BOTH paths, so the taken path was
+ * jumping straight past an instruction the hardware always runs.
+ *
+ *   08804000  beq  $v0,$zero,0x08804010    A -- stays inside A
+ *   08804004  addiu $v0,$v0,1              delay slot -- B's entry
+ *   08804008  jr   $ra                     B
+ *   0880400C  nop
+ *   08804010  nop                          A's other path
+ *   08804014  jr   $ra                     A
+ *   08804018  nop
+ */
+static const uint32_t SLOT_GOTO_CODE[] = {
+    0x10400003u, 0x24420001u, 0x03E00008u, 0x00000000u,
+    0x00000000u, 0x03E00008u, 0x00000000u,
+};
+
+/* The same, but the branch leaves the body: the slot has to run before the
+ * tail call.
+ *
+ *   08804000  beq  $v0,$zero,0x0880400C    A -- transfers out
+ *   08804004  lui  $v0,0x1234              delay slot -- B's entry
+ *   08804008  nop                          B
+ *   0880400C  jr   $ra                     the target
+ *   08804010  nop
+ */
+static const uint32_t SLOT_TAIL_CODE[] = {
+    0x10400002u, 0x3C021234u, 0x00000000u, 0x03E00008u, 0x00000000u,
+};
+
+/* A likely branch whose delay slot belongs to another body. A likely branch
+ * nullifies its slot when NOT taken, so the slot belongs inside the taken path
+ * and nowhere else -- and with the slot owned by another body there was no
+ * taken path to put it in.
+ *
+ *   08804000  blezl $v0,0x08804010         A
+ *   08804004  addiu $v0,$v0,1              delay slot -- B's entry
+ *   08804008  jr   $ra                     B
+ *   0880400C  nop
+ *   08804010  nop                          A's other path
+ *   08804014  jr   $ra                     A
+ *   08804018  nop
+ */
+static const uint32_t SLOT_LIKELY_CODE[] = {
+    0x58400003u, 0x24420001u, 0x03E00008u, 0x00000000u,
+    0x00000000u, 0x03E00008u, 0x00000000u,
+};
+
 /* Discover from `seeds` and emit, returning the generated .c (caller frees). */
 static char *emit_synthetic(const char *prefix, const uint32_t *words, size_t nwords,
                             const uint32_t *seeds, int nseeds, int *nfuncs_out) {
@@ -197,6 +251,33 @@ static void expect_absent(const char *src, const char *needle, const char *why) 
     }
 }
 
+/* One body, from its `static void psp_body_<addr>` to the wrapper emitted right
+ * after it.
+ *
+ * These checks have to be scoped this way. The delay slot is the *entry* of the
+ * body next door, so the very same instruction is emitted twice in the file:
+ * once in the taken path here, once as that body's first statement. An
+ * unbounded `strstr` finds the neighbour's copy and passes for the wrong
+ * reason -- measured: without the scoping, the tail-call case passed on the
+ * rule that had no slot in the taken path at all. */
+static const char *find_in(const char *from, const char *to, const char *needle) {
+    const char *p = strstr(from, needle);
+    return (p && p < to) ? p : NULL;
+}
+
+static char *body_window(const char *src, const char *name, size_t *len) {
+    const char *b = strstr(src, name);
+    if (!b) return NULL;
+    const char *e = strstr(b, "\nvoid psp_func_");
+    if (!e) e = b + strlen(b);
+    *len = (size_t)(e - b);
+    char *w = (char *)malloc(*len + 1);
+    if (!w) return NULL;
+    memcpy(w, b, *len);
+    w[*len] = '\0';
+    return w;
+}
+
 static void check_terminal_transfer_stays_tail(void) {
     /* --- a gap owned by another function --- */
     {
@@ -253,6 +334,77 @@ static void check_terminal_transfer_stays_tail(void) {
                           "no stack observation on the likely branch's taken path");
             free(src);
         }
+    }
+}
+
+/* A branch delays BOTH paths. A slot this body owns is emitted inline and runs
+ * on both; a slot another body owns cannot be, so the taken path has to run it
+ * itself -- otherwise the branch jumps over an instruction the hardware always
+ * executes, and the code at the target reads a register nobody set.
+ *
+ * Measured on LocoRoco (UCES00304): 0x1571C is `beq $v0,$zero,0x15774` whose
+ * slot at 0x15720 is `lui $v0,0x1C`, and 0x15774 loads through $v0; the taken
+ * path left it zero and the game read the module's own code as a table. */
+static void check_delay_slot_runs_on_the_taken_path(void) {
+    /* --- the branch stays inside its body --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 4u };
+        int n = 0;
+        char *src = emit_synthetic("t_slot_goto", SLOT_GOTO_CODE, 7, seeds, 2, &n);
+        size_t len = 0;
+        char *body = src ? body_window(src, "static void psp_body_08804000", &len) : NULL;
+        if (body) {
+            const char *end = body + len;
+            const char *cond = find_in(body, end, "int _c = (r_v0 == r_zero);");
+            const char *take = cond ? find_in(cond, end, "if (_c) {") : NULL;
+            const char *slot = take ? find_in(take, end, "r_v0 = r_v0 + 1;") : NULL;
+            const char *jump = slot ? find_in(slot, end, "goto L_08804010;") : NULL;
+            CHECK(cond && take && slot && jump,
+                  "the taken path runs the delay slot before it branches inside");
+            free(body);
+        }
+        free(src);
+    }
+
+    /* --- the branch leaves the body through a tail call --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 4u };
+        int n = 0;
+        char *src = emit_synthetic("t_slot_tail", SLOT_TAIL_CODE, 5, seeds, 2, &n);
+        size_t len = 0;
+        char *body = src ? body_window(src, "static void psp_body_08804000", &len) : NULL;
+        if (body) {
+            const char *end = body + len;
+            const char *cond = find_in(body, end, "int _c = (r_v0 == r_zero);");
+            const char *take = cond ? find_in(cond, end, "if (_c) {") : NULL;
+            const char *slot = take ? find_in(take, end, "r_v0 = 0x12340000u;") : NULL;
+            const char *call = slot ? find_in(slot, end, "psp_func_0880400C();") : NULL;
+            CHECK(cond && take && slot && call,
+                  "the taken path runs the delay slot before the tail transfer");
+            expect_tail_transfer(body, "psp_func_0880400C();",
+                                 "the taken path of a branch still ends in the transfer");
+            free(body);
+        }
+        free(src);
+    }
+
+    /* --- a likely branch: the slot belongs to the taken path and nowhere else --- */
+    {
+        uint32_t seeds[2] = { BASE, BASE + 4u };
+        int n = 0;
+        char *src = emit_synthetic("t_slot_likely", SLOT_LIKELY_CODE, 7, seeds, 2, &n);
+        size_t len = 0;
+        char *body = src ? body_window(src, "static void psp_body_08804000", &len) : NULL;
+        if (body) {
+            const char *end = body + len;
+            const char *take = find_in(body, end, "if ((int32_t)r_v0 <= 0) {");
+            const char *slot = take ? find_in(take, end, "r_v0 = r_v0 + 1;") : NULL;
+            const char *jump = slot ? find_in(slot, end, "goto L_08804010;") : NULL;
+            CHECK(take && slot && jump,
+                  "a likely branch runs its delay slot inside the taken path");
+            free(body);
+        }
+        free(src);
     }
 }
 
@@ -414,6 +566,7 @@ int main(void) {
     a_analysis_free(&an2);
 
     check_terminal_transfer_stays_tail();
+    check_delay_slot_runs_on_the_taken_path();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
