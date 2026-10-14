@@ -146,6 +146,8 @@ void psp_hle_init(void) {
     psp_sysmem_register();
     psp_threadman_init();
     psp_threadman_register();
+    psp_intrman_init();
+    psp_intrman_register();
     psp_display_init();
     psp_display_register();
     psp_ge_init();

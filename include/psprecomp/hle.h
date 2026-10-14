@@ -183,6 +183,26 @@ uint64_t psp_threadman_parks(void);
 uint64_t psp_threadman_vtime_us(void);
 void     psp_threadman_dump(FILE *out);
 
+/* InterruptManager: sub-interrupt handlers, and the points where an interrupt
+ * is delivered. See the header of src/hle/intrman.c for why a game can be
+ * stuck in a loop that no amount of implementing `sleep` gets it out of. */
+void psp_intrman_init(void);
+void psp_intrman_register(void);
+void psp_intrman_reset(void);
+
+/* Deliver one interrupt to every enabled handler. Called from the places where
+ * the guest explicitly waits for time to pass -- SleepThread, DelayThread and
+ * the vblank wait -- since with no timer there is nothing else to hook. Safe to
+ * call from inside a handler: delivery does not re-enter. */
+void psp_intr_tick(void);
+
+/* 0 until a game registers a handler, and the first number worth looking at
+ * when a wait never ends. */
+int      psp_intr_handlers(void);      /* registered */
+int      psp_intr_enabled(void);       /* registered *and* enabled */
+uint64_t psp_intr_deliveries(void);
+uint64_t psp_intr_unresolved(void);    /* handler address that is not recompiled */
+
 /* How many threads were created and how many were actually started. The gap
  * between the two is the first thing to look at when a game waits on a flag
  * nothing ever arms: a created-but-never-started worker explains it exactly,
