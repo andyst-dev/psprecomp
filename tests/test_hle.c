@@ -1045,6 +1045,80 @@ static void test_rtc(void) {
     CHECK(psp_rtc_ticks() == was + 1, "and still counts as a call served");
 }
 
+/* ---- sceAudio ------------------------------------------------------------ */
+
+static void test_audio(void) {
+    psp_misc_reset();
+    psp_threadman_reset();
+
+    const uint32_t RESERVE = psp_nid("sceAudioChReserve");
+    const uint32_t RELEASE = psp_nid("sceAudioChRelease");
+    const uint32_t DATALEN = psp_nid("sceAudioSetChannelDataLen");
+    const uint32_t OUTBLK  = psp_nid("sceAudioOutputPannedBlocking");
+    const uint32_t OUT     = psp_nid("sceAudioOutputPanned");
+    const uint32_t REST    = psp_nid("sceAudioGetChannelRestLength");
+
+    const uint32_t BUF = 0x0880A000u;      /* guest memory, inside RAM */
+    const uint64_t ONE_BUFFER = 1024ull * 1000000ull / 44100ull;   /* 23219 us */
+
+    CHECK(call(RESERVE, (uint32_t)-1, 1024, 0, 0) == 0, "a channel is reserved");
+
+    /* The first block finds an idle channel: there is nothing to wait for, and
+     * a call that waited anyway would waste one buffer per channel at startup. */
+    uint64_t t0 = psp_threadman_vtime_us();
+    CHECK(call(OUTBLK, 0, BUF, 0, 0) == 1024, "the first block answers with the buffer's samples");
+    CHECK(psp_threadman_vtime_us() == t0, "and does not wait: the channel was idle");
+
+    /* The second waits out the one in flight. That wait is the whole point: it
+     * is what paces a game's audio thread at 44.1 kHz, and without it the loop
+     * around this call spins and starves every other thread. */
+    CHECK(call(OUTBLK, 0, BUF, 0, 0) == 1024, "the next block still answers");
+    CHECK(psp_threadman_vtime_us() - t0 == ONE_BUFFER,
+          "after waiting exactly one buffer, got %llu us (expected %llu)",
+          (unsigned long long)(psp_threadman_vtime_us() - t0), (unsigned long long)ONE_BUFFER);
+
+    /* What is left is read, not remembered, so reading it twice is the same
+     * answer -- a game uses it to decide how long it has before the next block. */
+    uint32_t rest = call(REST, 0, 0, 0, 0);
+    CHECK(rest > 0 && rest <= 1024, "the channel reports its rest in samples, got %u", rest);
+    CHECK(call(REST, 0, 0, 0, 0) == rest, "and reading it does not consume it");
+
+    /* A block that fits inside the rest does not wait for the buffer to end: the
+     * guest is allowed to hand over as soon as there is room. */
+    uint64_t t1 = psp_threadman_vtime_us();
+    psp_threadman_park_us(ONE_BUFFER);                  /* let the buffer drain */
+    CHECK(call(OUTBLK, 0, BUF, 0, 0) == 1024, "a block after the buffer drained answers");
+    CHECK(psp_threadman_vtime_us() - t1 == ONE_BUFFER, "and does not add a second wait");
+    (void)t1;
+
+    /* The non-blocking variant hands the buffer over and returns: a game that
+     * uses it is deliberately not paced by it. */
+    uint64_t t2 = psp_threadman_vtime_us();
+    CHECK(call(OUT, 0, BUF, 0, 0) == 1024, "the non-blocking block answers");
+    CHECK(psp_threadman_vtime_us() == t2, "without waiting");
+
+    /* The wait the guest asks for is the pacing, so resizing the buffer moves
+     * it: 512 samples is half the wait of 1024, and it applies to the *next*
+     * buffer, not to the one already playing. */
+    CHECK(call(DATALEN, 0, 512, 0, 0) == 0, "the guest resizes its buffer");
+    uint64_t t3 = psp_threadman_vtime_us();
+    psp_threadman_park_us(ONE_BUFFER);                   /* the 1024-sample buffer drains */
+    call(OUTBLK, 0, BUF, 0, 0);                          /* starts a 512-sample one: no wait */
+    uint64_t t4 = psp_threadman_vtime_us();
+    CHECK(t4 - t3 == ONE_BUFFER, "the buffer already playing keeps its own length");
+    call(OUTBLK, 0, BUF, 0, 0);                          /* and waits out the new one */
+    CHECK(psp_threadman_vtime_us() - t4 == 512ull * 1000000ull / 44100ull,
+          "the next block waits the new length, got %llu us",
+          (unsigned long long)(psp_threadman_vtime_us() - t4));
+
+    /* A released channel refuses a block rather than answering a plausible
+     * sample count: the guest must not be told its audio went out. */
+    CHECK(call(RELEASE, 0, 0, 0, 0) == 0, "the channel is released");
+    CHECK(call(OUTBLK, 0, BUF, 0, 0) != 1024, "and a released channel refuses a block");
+    CHECK(psp_audio_blocks() == 6, "six blocks went out, got %llu",
+          (unsigned long long)psp_audio_blocks());
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1067,6 +1141,7 @@ int main(void) {
     test_display();
     test_sub_interrupts();
     test_callbacks();
+    test_audio();
     test_umd();
     test_rtc();
     test_unimplemented_logging();

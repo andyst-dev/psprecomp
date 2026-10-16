@@ -149,12 +149,31 @@ static void hle_ReadBufferPositive(void) {
 /* ---- sceAudio ------------------------------------------------------------ */
 
 #define AUDIO_CHANNELS 8
+/* The hardware's sample rate is fixed at 44.1 kHz: a buffer of N samples lasts
+ * N/44100 s whatever the channel's format is (mono or stereo changes how many
+ * bytes a sample takes, not how long it plays). */
+#define AUDIO_RATE     44100u
 
-typedef struct { int reserved; uint32_t samples; uint32_t format; } audio_ch;
+typedef struct {
+    int      reserved;
+    uint32_t samples;     /* the buffer length the guest asked for */
+    uint32_t format;
+    int      playing;     /* a buffer is in flight on this channel */
+    /* When the buffer in flight finishes, in the guest's own clock. Held as the
+     * end rather than the start on purpose: a guest that resizes the buffer
+     * while one is playing changes the *next* block, not the one already in the
+     * hardware. */
+    uint64_t end_us;
+} audio_ch;
 static audio_ch g_audio[AUDIO_CHANNELS];
 static uint64_t g_audio_blocks;
 
 uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
+
+/* How long a block on this channel plays for. */
+static uint64_t buffer_us(const audio_ch *c) {
+    return c->samples ? (uint64_t)c->samples * 1000000ull / AUDIO_RATE : 0;
+}
 
 static void hle_ChReserve(void) {
     /* (channel, samplecount, format) -- channel -1 means "any". */
@@ -167,6 +186,8 @@ static void hle_ChReserve(void) {
     g_audio[ch].reserved = 1;
     g_audio[ch].samples = psp_arg(1);
     g_audio[ch].format  = psp_arg(2);
+    g_audio[ch].playing = 0;
+    g_audio[ch].end_us  = 0;
     psp_ret((uint32_t)ch);
 }
 
@@ -174,19 +195,72 @@ static void hle_ChRelease(void) {
     int32_t ch = (int32_t)psp_arg(0);
     if (ch < 0 || ch >= AUDIO_CHANNELS) { psp_ret(0x80000001); return; }
     g_audio[ch].reserved = 0;
+    g_audio[ch].playing = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Output blocks on hardware until the previous buffer drains, which is what
- * paces a game's audio thread. With nothing consuming samples it returns
- * immediately -- the block count is what tells you audio is flowing. */
-static void hle_Output(void) {
-    g_audio_blocks++;
-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
+static void hle_SetChannelDataLen(void) {
+    /* (channel, samplecount). A guest that resizes its buffer changes how long a
+     * block plays for, so the pacing follows it rather than a value remembered
+     * from the reserve. */
+    int32_t ch = (int32_t)psp_arg(0);
+    if (ch < 0 || ch >= AUDIO_CHANNELS || !g_audio[ch].reserved) { psp_ret(0x80000001); return; }
+    g_audio[ch].samples = psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Zero remaining means "ready for more", so a game's audio loop keeps going. */
-static void hle_GetChannelRestLength(void) { psp_ret(0); }
+/* Hand a buffer to the channel and, for the blocking variants, wait out the one
+ * already in flight.
+ *
+ * That wait is the whole point of this section. On hardware the audio hardware
+ * drains a buffer in real time, so `sceAudioOutput*Blocking` is what paces a
+ * game's audio thread -- one call per buffer, never faster. A toolkit that
+ * returns immediately turns that thread into a spin, and because the CPU is
+ * only handed over where the guest waits, the spin starves every other thread.
+ * Measured on LocoRoco before this: 411 869 907 iterations of the one loop
+ * around this call, 12 parks and 27 ms of virtual time in a 30-second run, with
+ * 11 threads alive and none of them getting anywhere.
+ *
+ * The wait is the buffer's own duration, taken from the guest's clock rather
+ * than from the host's: the virtual clock is the one the guest reads, and the
+ * host's own wait is capped elsewhere (REAL_TICK_US), so a game can be paced at
+ * 44.1 kHz without the run taking 44.1 kHz of wall clock to get through.
+ *
+ * The argument layouts differ between the variants (OutputBlocking has no pan
+ * pair), which is why only the channel is read here: the buffer pointer and the
+ * volumes are not part of the timing. */
+static uint32_t start_block(int32_t ch, int blocking) {
+    if (ch < 0 || ch >= AUDIO_CHANNELS || !g_audio[ch].reserved) return 0x80000001;
+    audio_ch *c = &g_audio[ch];
+    uint64_t dur = buffer_us(c);
+    if (blocking && c->playing) {
+        uint64_t now = psp_threadman_vtime_us();
+        if (now < c->end_us) psp_threadman_park_us(c->end_us - now);
+    }
+    c->end_us = psp_threadman_vtime_us() + dur;
+    c->playing = 1;
+    g_audio_blocks++;
+    return c->samples;
+}
+
+static void hle_OutputBlocking(void) { psp_ret(start_block((int32_t)psp_arg(0), 1)); }
+
+/* The non-blocking variant hands the buffer over and returns: a game that uses
+ * it is deliberately not paced by it, and it is the *next* blocking call that
+ * waits. */
+static void hle_Output(void) { psp_ret(start_block((int32_t)psp_arg(0), 0)); }
+
+/* What is left of the buffer playing now, in samples -- derived from the clock
+ * and the buffer's length, not remembered. Zero means the channel is free,
+ * which is what a game's audio loop reads to decide it can hand over more. */
+static void hle_GetChannelRestLength(void) {
+    int32_t ch = (int32_t)psp_arg(0);
+    if (ch < 0 || ch >= AUDIO_CHANNELS || !g_audio[ch].reserved) { psp_ret(0x80000001); return; }
+    audio_ch *c = &g_audio[ch];
+    uint64_t now = psp_threadman_vtime_us();
+    if (!c->playing || now >= c->end_us) { psp_ret(0); return; }
+    psp_ret((uint32_t)((c->end_us - now) * AUDIO_RATE / 1000000ull));
+}
 
 void psp_misc_reset(void) {
     /* The interrupt mask is per thread and lives in the scheduler; a reset
@@ -241,11 +315,11 @@ void psp_misc_register(void) {
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
-    psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_Output);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_Output);
+    psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputBlocking);
     psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_Output);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
-    psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_ok);
+    psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
 }

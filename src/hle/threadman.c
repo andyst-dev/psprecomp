@@ -557,6 +557,8 @@ static void boot_record(void) {
  * "let the others run". */
 void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
 
+void psp_threadman_park_us(uint64_t us) { park_for(W_DELAY, us); }
+
 void psp_threadman_frame_wait(void) {
     deliver_tick();
     park_for(W_DELAY, FRAME_US);

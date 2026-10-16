@@ -214,6 +214,14 @@ int psp_callback_valid(uint32_t uid);
 void psp_threadman_yield(void);
 void psp_threadman_frame_wait(void);
 
+/* Give the CPU away for a stated amount of the guest's own time. A blocking
+ * device call uses this to take the time the hardware would have taken: the
+ * audio hardware drains a buffer in real time, so sceAudio's blocking output
+ * waits out one buffer here (see src/hle/misc.c). The guest's clock advances by
+ * exactly `us`; the host's own wait is capped inside the scheduler, so a game
+ * paced at 44.1 kHz does not make the run take 44.1 kHz of wall clock. */
+void psp_threadman_park_us(uint64_t us);
+
 /* Interrupt masking is per thread, and the cookie is the previous state --
  * which is why resuming a nested suspend does not enable interrupts. */
 int  psp_threadman_intr_suspend(void);
