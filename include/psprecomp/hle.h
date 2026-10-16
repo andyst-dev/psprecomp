@@ -107,23 +107,30 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 
 /* ---- error codes --------------------------------------------------------- */
 /* Only the ones the implemented functions can actually return. Games branch on
- * these, so returning a plausible-looking wrong value is worse than failing. */
+ * these, so returning a plausible-looking wrong value is worse than failing.
+ *
+ * The numbers are pspsdk's `pspkerror.h`, which is why they are written next to
+ * their names. Three of them used to be wrong here -- UNKNOWN_UID,
+ * ILLEGAL_MEMBLOCK and ILLEGAL_ADDR -- and the mistake was invisible, because
+ * the tests compare a return against the *name*, and a name with a wrong number
+ * compares fine against itself. A plausible-looking constant is exactly the
+ * failure this toolkit exists to catch, so it is verified against the source
+ * rather than remembered. */
 #define SCE_KERNEL_ERROR_OK              0
 #define SCE_KERNEL_ERROR_ERROR           0x80020001
 #define SCE_KERNEL_ERROR_NOTIMPLEMENTED  0x80020002
-#define SCE_KERNEL_ERROR_ILLEGAL_ADDR    0x80020005
+#define SCE_KERNEL_ERROR_UNKNOWN_UID     0x800200CB
+#define SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT 0x800200D2
+#define SCE_KERNEL_ERROR_ILLEGAL_ADDR    0x800200D3
 #define SCE_KERNEL_ERROR_NO_MEMORY       0x80020190
 #define SCE_KERNEL_ERROR_ILLEGAL_ATTR    0x80020191
-#define SCE_KERNEL_ERROR_UNKNOWN_UID     0x800201A2
-#define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201A9
 #define SCE_KERNEL_ERROR_ILLEGAL_THID    0x80020197
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT    0x800201A8
+#define SCE_KERNEL_ERROR_WAIT_CANCEL     0x800201A9
 #define SCE_KERNEL_ERROR_THREAD_TERMINATED 0x800201AC
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
 #define SCE_KERNEL_ERROR_EVF_COND        0x800201AF
-/* Added for the power callback slots; the neighbouring codes are corrected on
- * the UMD/RTC branch (their values arrived from the same pspsdk source). */
-#define SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT 0x800200D2
+#define SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK 0x800201B6
 
 /* ---- the subsystems ------------------------------------------------------ */
 
