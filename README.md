@@ -92,6 +92,8 @@ psprecomp/
 │       ├── display.c         # Framebuffer, vblank, capture
 │       ├── sascore.c         # sceSasCore audio synthesis
 │       ├── iofilemgr.c       # sceIo* file I/O
+│       ├── umd.c             # sceUmdUser: the state the drive reports
+│       ├── rtc.c             # sceRtc: microseconds since 0001-01-01
 │       └── misc.c            # sceCtrl, ModuleMgr, LoadExec, Kernel_Library
 │
 ├── include/psprecomp/        # Public API
@@ -161,7 +163,7 @@ It does not yet render. Being specific about which parts are real:
 | **C emitter** | ✅ Working | Every discovered function, every label individually dispatchable (13,682 entries) — computed jumps resolve by construction |
 | **Runtime** | ✅ Working | Register file, memory map with cache mirrors, dispatch, static constructors |
 | **VFPU** | 🔨 Partial | Arithmetic, matrix ops, constants, immediates, prefixes. 108 of 137,748 instructions still trap (0.08%) |
-| **HLE firmware** | 🔨 Partial | 112 registrations across sysmem, threadman, GE, display, sascore, io, ctrl. Every NID verified against SHA-1 of its own name |
+| **HLE firmware** | 🔨 Partial | 144 registrations across sysmem, threadman, GE, display, sascore, io, umd, rtc and ctrl. Every NID verified against SHA-1 of its own name |
 | **GE rasterizer** | 🔨 Partial | Triangles, strips, sprites in through-mode; six tests assert *where* pixels land. Transformed geometry counted, not drawn |
 | **Threading** | ✅ Works | One host thread per guest thread, one CPU handed over explicitly; blocking waits, wakeups, semaphores, event flags, callbacks and variable pools |
 | **A game on screen** | ❌ Not yet | The flagship reaches its allocator and stalls in start-up. See [BRINGUP.md](docs/BRINGUP.md) |

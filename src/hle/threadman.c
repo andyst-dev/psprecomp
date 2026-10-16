@@ -1223,6 +1223,19 @@ static void hle_DeleteCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);
 }
 
+/* Whether an id names a callback the guest has created.
+ *
+ * Exported because a subsystem that takes a callback id has to be able to
+ * refuse one that is not a callback, and only this table can answer that. The
+ * wrong alternative is to accept any non-zero id: a game that then believes it
+ * has a callback registered is wrong in a way nothing downstream will report. */
+int psp_callback_valid(uint32_t uid) {
+    if (!uid) return 0;
+    for (int i = 0; i < MAX_CBS; i++)
+        if (g_cb[i].used && g_cb[i].uid == uid) return 1;
+    return 0;
+}
+
 uint64_t psp_threadman_created(void) { return g_created; }
 uint64_t psp_threadman_started(void) { return g_started; }
 
