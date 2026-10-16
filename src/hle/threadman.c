@@ -131,6 +131,12 @@ typedef struct {
     uint32_t exit_status;
     int      used;
 
+    /* Started, spawned, and has never had the CPU. A park hands the CPU over to
+     * it rather than racing the host's scheduler for it -- see the handover in
+     * park_us(). Cleared by the thread itself on its first acquisition, so it
+     * cannot outlive the thing it describes. */
+    int      cpu_pending;
+
     /* Where this thread's registers live while it does not hold the CPU. */
     psp_cpu_state ctx;
 
@@ -231,6 +237,15 @@ static pthread_cond_t  g_baton_cv = PTHREAD_COND_INITIALIZER;
 static int             g_baton_owned;
 static pthread_t       g_baton_owner;
 
+/* Host threads sitting in baton_acquire, i.e. wanting the CPU right now. A
+ * parker reads it to decide whether it may take the CPU back (see the handover
+ * below); a thread that is waiting there has nowhere else to be, so it takes
+ * the baton as soon as it is free -- the wait cannot be a deadlock. */
+static int             g_baton_waiters;
+static uint64_t        g_baton_takes;      /* every acquisition, by anyone */
+static uint64_t        g_handovers;        /* parks that handed the CPU over */
+static uint64_t        g_handovers_expired;
+
 /* Per host thread, so a nested park (an interrupt handler that waits) restores
  * its outer nesting on the way back. */
 static _Thread_local int g_tls_depth;
@@ -268,11 +283,17 @@ static void baton_acquire(void) {
     if (g_tls_depth > 0) { g_tls_depth++; return; }   /* already ours */
     pthread_mutex_lock(&g_baton_m);
     TRACE_SCHED("acquire: owned=%d by other\n", g_baton_owned);
+    g_baton_waiters++;
     while (g_baton_owned) pthread_cond_wait(&g_baton_cv, &g_baton_m);
+    g_baton_waiters--;
     g_baton_owned = 1;
     g_baton_owner = pthread_self();
+    g_baton_takes++;
     g_tls_depth = 1;
     g_switches++;
+    /* Whoever is holding a park open for a handover has just got what it was
+     * waiting for. */
+    pthread_cond_broadcast(&g_baton_cv);
     TRACE_SCHED("acquired\n");
     pthread_mutex_unlock(&g_baton_m);
 }
@@ -285,6 +306,56 @@ static void baton_release(void) {
     pthread_cond_broadcast(&g_baton_cv);
     pthread_mutex_unlock(&g_baton_m);
     TRACE_SCHED("release\n");
+}
+
+/* Is anyone waiting for the CPU? Two shapes, and both are certain to take it:
+ * a thread that has been started and has never run, and a host thread already
+ * sitting in baton_acquire. Neither is waiting for anything else, so a parker
+ * that lets them go first cannot be left waiting for an event that never
+ * comes. */
+static int cpu_wanted_locked(void) {
+    if (g_baton_waiters > 0) return 1;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (g_thread[i].used && g_thread[i].cpu_pending) return 1;
+    return 0;
+}
+
+/* The handover: what "a park gives the CPU away" has to mean.
+ *
+ * Releasing the baton and taking it straight back makes the handover a race
+ * with the host's own scheduler -- and the host's scheduler is free to run the
+ * parking thread first. Measured, and it is why this exists: a thread started
+ * just before a delay had not been scheduled yet when the delay ended (the park
+ * waits REAL_TICK_US of *host* time for a wakeup that a delay never gets), so
+ * the delay returned before the thread it was supposed to let through had run.
+ * A guest never sees that: on one core a started thread of equal priority runs.
+ * The starter's own test flaked about one run in ten on it.
+ *
+ * So the CPU is not taken back while someone wants it. Bounded anyway, and it
+ * says so when the bound is reached: the alternative to a capped wait is a run
+ * with nothing in it, and a wait that gives up has to be distinguishable from a
+ * wait that was never needed. In practice this resolves in microseconds --
+ * the thread it waits for is already blocked on the baton. */
+#define HANDOVER_CAP_US 20000    /* 20 ms of host time */
+static void handover_wait_locked(void) {
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    uint64_t ns = (uint64_t)dl.tv_nsec + (uint64_t)HANDOVER_CAP_US * 1000ull;
+    dl.tv_sec  += (time_t)(ns / 1000000000ull);
+    dl.tv_nsec  = (long)(ns % 1000000000ull);
+
+    while (cpu_wanted_locked()) {
+        if (pthread_cond_timedwait(&g_baton_cv, &g_baton_m, &dl) == ETIMEDOUT) {
+            if (g_handovers_expired++ < 1)
+                fprintf(stderr,
+                        "psprecomp: a park waited %d ms to hand the CPU over and gave up"
+                        " -- the thread it waited for was not scheduled. The run continues;"
+                        " further expiries are counted, not printed"
+                        " (psp_threadman_handover_expired())\n",
+                        HANDOVER_CAP_US / 1000);
+            break;
+        }
+    }
 }
 
 /* Give the CPU away and wait to be woken, or for `timeout_us` of *virtual*
@@ -306,8 +377,10 @@ static int park_us(uint64_t timeout_us) {
     }
 
     TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
+    uint64_t takes0 = 0;
     if (depth) {                        /* give the CPU away, however nested */
         pthread_mutex_lock(&g_baton_m);
+        takes0 = g_baton_takes;         /* to see, below, whether anyone ran */
         g_baton_owned = 0;
         pthread_cond_broadcast(&g_baton_cv);
         pthread_mutex_unlock(&g_baton_m);
@@ -342,6 +415,13 @@ static int park_us(uint64_t timeout_us) {
 
     if (depth) {
         pthread_mutex_lock(&g_baton_m);
+        /* The handover, before the CPU is taken back: a started thread that has
+         * never run, or a host thread already queued for the baton, goes first.
+         * Without this the re-acquire below is a race with the host's scheduler
+         * -- see handover_wait_locked(). */
+        int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
+        if (cpu_wanted_locked()) { handover_wait_locked(); handed = 1; }
+        if (handed) g_handovers++;
         while (g_baton_owned) pthread_cond_wait(&g_baton_cv, &g_baton_m);
         g_baton_owned = 1;
         g_baton_owner = pthread_self();
@@ -413,6 +493,8 @@ void psp_threadman_reset(void) {
     g_switches = 0;
     g_parks = 0;
     g_wait_gaveup = 0;
+    g_handovers = 0;
+    g_handovers_expired = 0;
     g_vtime_us = 0;
     g_epoch_us = host_now_us();
 
@@ -457,6 +539,13 @@ void psp_threadman_frame_wait(void) {
 uint64_t psp_threadman_switches(void) { return g_switches; }
 uint64_t psp_threadman_parks(void)    { return g_parks; }
 uint64_t psp_threadman_vtime_us(void) { return g_vtime_us; }
+/* Parks after which another thread had run -- either it took the CPU while this
+ * one was parked, or the park waited for it before taking the CPU back -- and
+ * the parks that gave up before the thread they waited for was scheduled. The
+ * second number is the interesting one when it is not zero: it means the guest
+ * did not get the handover it was promised. */
+uint64_t psp_threadman_handovers(void)         { return g_handovers; }
+uint64_t psp_threadman_handover_expired(void)  { return g_handovers_expired; }
 
 void psp_threadman_dump(FILE *out) {
     fprintf(out, "CPU               : %s\n",
@@ -597,6 +686,12 @@ static void *guest_thread_main(void *arg) {
     psp_cpu.r[PSP_REG_RA] = 0;
 
     t->state = TH_RUNNING;
+    /* We have the CPU: the flag that says "started, never run" is cleared by the
+     * thread itself, and whoever was holding a park open for it is told. */
+    pthread_mutex_lock(&g_baton_m);
+    t->cpu_pending = 0;
+    pthread_cond_broadcast(&g_baton_cv);
+    pthread_mutex_unlock(&g_baton_m);
     g_started++;
     fprintf(stderr, "thread %u started : entry 0x%08X\n", t->uid, t->entry);
 
@@ -673,6 +768,10 @@ static void hle_StartThread(void) {
     t->arglen = psp_arg(1);
     t->argp   = psp_arg(2);
     t->state  = TH_READY;
+    /* Set before the host thread exists, so a park that happens between here and
+     * the new thread's first acquisition hands the CPU over instead of racing
+     * for it. That window is the whole reason this flag is not just `state`. */
+    t->cpu_pending = 1;
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -681,6 +780,7 @@ static void hle_StartThread(void) {
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         t->state = TH_DORMANT;
+        t->cpu_pending = 0;
         psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
         return;
     }
