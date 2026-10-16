@@ -1119,6 +1119,98 @@ static void test_audio(void) {
           (unsigned long long)psp_audio_blocks());
 }
 
+/* ---- the four calls a game's main loop lives on -------------------------- */
+
+/* These are the calls the run reached the first time the audio thread stopped
+ * eating the CPU: a frame boundary, the guest's `while (IsVblank())` after it,
+ * which buffer is being scanned out, what changed on the pad, and the system
+ * parameters the game reads before it draws anything. */
+static void test_main_loop_calls(void) {
+    psp_display_reset();
+    psp_misc_reset();
+    psp_threadman_reset();
+
+    const uint32_t VBLANK   = psp_nid("sceDisplayWaitVblankCB");
+    const uint32_t ISVBLANK = psp_nid("sceDisplayIsVblank");
+    const uint32_t GETFB    = psp_nid("sceDisplayGetFrameBuf");
+    const uint32_t SETFB    = psp_nid("sceDisplaySetFrameBuf");
+    const uint32_t LATCH    = psp_nid("sceCtrlReadLatch");
+    const uint32_t BUFPOS   = psp_nid("sceCtrlReadBufferPositive");
+    const uint32_t SYSPARAM = psp_nid("sceUtilityGetSystemParamInt");
+
+    const uint32_t OUT_FB = 0x0880B000u, OUT_W = 0x0880B010u, OUT_FMT = 0x0880B020u;
+    const uint32_t LATCH_ADDR = 0x0880B100u;
+    const uint32_t FB = 0x04000000u;      /* guest VRAM */
+
+    /* A frame boundary is where the guest asks for time to pass, so it moves the
+     * clock -- and it is where a callback would be delivered. */
+    uint64_t t0 = psp_threadman_vtime_us();
+    CHECK(call(VBLANK, 0, 0, 0, 0) == 0, "the vblank wait answers");
+    CHECK(psp_threadman_vtime_us() > t0, "and a frame passed, got %llu us",
+          (unsigned long long)(psp_threadman_vtime_us() - t0));
+    CHECK(psp_display_vblanks() == 1, "and it is counted, got %llu",
+          (unsigned long long)psp_display_vblanks());
+
+    /* The guest's idiom right after it is `while (sceDisplayIsVblank());`, so
+     * the answer has to be able to turn false -- and it does, by one tick of the
+     * clock it is asking about, which is given away rather than spun on. */
+    CHECK(call(ISVBLANK, 0, 0, 0, 0) == 1, "just after a boundary the beam is in the blanking interval");
+    CHECK(call(ISVBLANK, 0, 0, 0, 0) == 0, "and one tick later it is not");
+    CHECK(psp_threadman_parks() > 0, "the wait gave the CPU away rather than spinning on it");
+
+    /* Which buffer is scanned out: what a double-buffering game asks to know
+     * which one it may draw into. The values are the ones it set. */
+    psp_write32(OUT_FB, 0xDEADBEEFu);
+    psp_write32(OUT_W, 0xDEADBEEFu);
+    psp_write32(OUT_FMT, 0xDEADBEEFu);
+    CHECK(call(SETFB, FB, 512, 3 /* 8888 */, 0) == 0, "a framebuffer is set");
+    CHECK(call(GETFB, OUT_FB, OUT_W, OUT_FMT, 1) == 0, "and read back");
+    CHECK(psp_read32(OUT_FB) == FB, "the address is the one that was set, got 0x%08X", psp_read32(OUT_FB));
+    CHECK(psp_read32(OUT_W) == 512, "with its stride, got %u", psp_read32(OUT_W));
+    CHECK(psp_read32(OUT_FMT) == 3, "and its format, got %u", psp_read32(OUT_FMT));
+    /* Address zero is mapped here (a PRX links there), so a null out-pointer is
+     * answered, never written through. */
+    CHECK(call(GETFB, 0, 0, 0, 1) == 0, "null destinations are answered, not written through");
+
+    /* The pad: a latch is the transition view, and it has to be *written* even
+     * when nothing changed -- an unanswered call leaves the guest reading its own
+     * stack as "which buttons are pressed". */
+    for (uint32_t i = 0; i < 16; i++) psp_write8(LATCH_ADDR + i, 0xAB);
+    CHECK(call(LATCH, LATCH_ADDR, 0, 0, 0) == 0, "the latch is read");
+    CHECK(psp_read32(LATCH_ADDR) == 0 && psp_read32(LATCH_ADDR + 4) == 0,
+          "with nothing pressed there are no transitions");
+    CHECK(psp_read32(LATCH_ADDR + 8) == 0 && psp_read32(LATCH_ADDR + 12) == ~0u,
+          "and press/release mirror each other");
+
+    psp_ctrl_set(0x0008u /* START */, 128, 128);      /* the host presses it */
+    uint32_t buf = 0x0880B200u;
+    CHECK(call(BUFPOS, buf, 1, 0, 0) == 1, "the buffer read answers one sample");
+    CHECK(psp_read32(buf + 4) == 0x0008u, "and reports the button, got 0x%X", psp_read32(buf + 4));
+    CHECK(call(LATCH, LATCH_ADDR, 0, 0, 0) == 0, "the latch is read again");
+    CHECK(psp_read32(LATCH_ADDR) == 0x0008u, "the button that went down is a make, got 0x%X",
+          psp_read32(LATCH_ADDR));
+    CHECK(psp_read32(LATCH_ADDR + 8) == 0x0008u, "and is still pressed");
+    CHECK(call(LATCH, LATCH_ADDR, 0, 0, 0) == 0, "a second read");
+    CHECK(psp_read32(LATCH_ADDR) == 0, "consumes the transition it reported");
+    psp_ctrl_set(0, 128, 128);
+    call(LATCH, LATCH_ADDR, 0, 0, 0);
+    CHECK(psp_read32(LATCH_ADDR + 4) == 0x0008u, "and a button that comes up is a break, got 0x%X",
+          psp_read32(LATCH_ADDR + 4));
+
+    /* The system parameters: the ones the toolkit can stand behind, and an id it
+     * cannot name refused rather than guessed. The timezone is the toolkit's own
+     * clock (UTC), not a preference. */
+    const uint32_t OUT_P = 0x0880B300u;
+    psp_write32(OUT_P, 0xDEADBEEFu);
+    CHECK(call(SYSPARAM, 8, OUT_P, 0, 0) == 0 && psp_read32(OUT_P) == 1,
+          "the language is English, got %u", psp_read32(OUT_P));
+    CHECK(call(SYSPARAM, 6, OUT_P, 0, 0) == 0 && psp_read32(OUT_P) == 0,
+          "the timezone is the one sceRtc answers -- UTC");
+    psp_write32(OUT_P, 0xDEADBEEFu);
+    CHECK(call(SYSPARAM, 11, OUT_P, 0, 0) != 0, "a parameter this toolkit cannot name is refused");
+    CHECK(psp_read32(OUT_P) == 0, "and its word is written as a defined nothing, not left as garbage");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1142,6 +1234,7 @@ int main(void) {
     test_sub_interrupts();
     test_callbacks();
     test_audio();
+    test_main_loop_calls();
     test_umd();
     test_rtc();
     test_unimplemented_logging();

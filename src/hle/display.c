@@ -29,6 +29,7 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
 static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
+static uint64_t g_vblank_us;      /* when the last frame boundary passed (guest clock) */
 
 void psp_display_reset(void) {
     g_fb_addr = 0;
@@ -38,6 +39,7 @@ void psp_display_reset(void) {
     g_mode_w = PSP_SCREEN_W;
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
+    g_vblank_us = 0;
 }
 
 void psp_display_init(void) { psp_display_reset(); }
@@ -137,6 +139,42 @@ static void hle_WaitVblank(void) {
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
      * CPU, the most natural place to hand the CPU over. */
     psp_threadman_frame_wait();
+    /* Where the boundary is, for sceDisplayIsVblank below. */
+    g_vblank_us = psp_threadman_vtime_us();
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* `sceDisplayIsVblank` asks where the beam is, and this display has no beam: a
+ * vblank is a *boundary* here (the frame wait above lands on one), not a window
+ * with a duration. So the answer is taken from the guest's own clock -- one tick
+ * after a boundary the beam is out of the blanking interval -- and when the
+ * answer is "yes, you are in it", one scheduling point is given away.
+ *
+ * That second half is not decoration. Measured on LocoRoco, the guest's idiom is
+ * the loop at 0x3EC5C: `while (sceDisplayIsVblank());`, asked immediately after
+ * the frame wait. Answering 1 without letting the clock it is asking about
+ * advance is a guest that spins forever inside a call that never parks. */
+#define VBLANK_WINDOW_US 1000ull
+
+static void hle_IsVblank(void) {
+    if (psp_threadman_vtime_us() - g_vblank_us < VBLANK_WINDOW_US) {
+        psp_threadman_yield();
+        psp_ret(1);
+        return;
+    }
+    psp_ret(0);
+}
+
+/* `sceDisplayGetFrameBuf(void **topaddr, int *bufferwidth, int *pixelformat,
+ * int sync)` -- which buffer is being scanned out, which is what a game with two
+ * buffers asks to know which one it may draw into. The pointers are checked
+ * before they are written because address zero is mapped in this toolkit (a PRX
+ * links there): a blind write would edit a module image instead of failing. */
+static void hle_GetFrameBuf(void) {
+    uint32_t top = psp_arg(0), width = psp_arg(1), format = psp_arg(2);
+    if (top)    psp_write32(top, g_fb_addr);
+    if (width)  psp_write32(width, g_fb_width);
+    if (format) psp_write32(format, g_fb_format);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -144,5 +182,8 @@ void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
+    psp_hle_register(0x8EB9EC49, "sceDisplay", "sceDisplayWaitVblankCB",      hle_WaitVblank);
+    psp_hle_register(0x4D4E10EC, "sceDisplay", "sceDisplayIsVblank",          hle_IsVblank);
+    psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
 }

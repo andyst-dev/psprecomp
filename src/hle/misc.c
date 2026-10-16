@@ -122,11 +122,45 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 static uint32_t g_buttons;
 static uint8_t  g_analog_x = 128, g_analog_y = 128;
 static uint32_t g_ctrl_frame;
+/* Transitions, which is what a latch is: which buttons went down and which came
+ * up since the last time the guest read it. Accumulated where the pad state is
+ * set, because that is the only moment a transition exists. */
+static uint32_t g_latch_make, g_latch_break;
+static uint64_t g_sysparam_unknown;
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
+    g_latch_make  |= buttons & ~g_buttons;   /* went down */
+    g_latch_break |= g_buttons & ~buttons;   /* came up */
     g_buttons = buttons;
     g_analog_x = ax;
     g_analog_y = ay;
+}
+
+/* The latch is the *transition* view of the pad, and a game reads it to see what
+ * changed since it last looked -- LocoRoco reads it immediately after a
+ * sceCtrlReadBufferPositive and publishes both to its own globals.
+ *
+ * The four words are written even when nothing changed, and that is the point of
+ * implementing this at all: an unimplemented call returns 0 and writes nothing,
+ * so the guest then reads its own stack slot as "which buttons are pressed" --
+ * garbage, which can read as every button held at once. A defined zero is worse
+ * than the truth and much better than that.
+ *
+ * uiMake / uiBreak are the transitions this file accumulated; uiPress is the
+ * mask currently held (the same value sceCtrlReadBufferPositive reports, so the
+ * two cannot disagree); uiRelease is its mirror -- the bits not held, which is
+ * how a game tests it (`latch.uiRelease & PSP_CTRL_X` asks whether X is up). The
+ * upper bits of uiRelease carry nothing, and no button test looks at them. Read
+ * consumes and peek does not, as with the buffer reads. */
+static void hle_ReadLatch(void) {
+    uint32_t latch = psp_arg(0);
+    if (!latch) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(latch + 0,  g_latch_make);
+    psp_write32(latch + 4,  g_latch_break);
+    psp_write32(latch + 8,  g_buttons);
+    psp_write32(latch + 12, ~g_buttons);
+    g_latch_make = g_latch_break = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -262,11 +296,68 @@ static void hle_GetChannelRestLength(void) {
     psp_ret((uint32_t)((c->end_us - now) * AUDIO_RATE / 1000000ull));
 }
 
+/* ---- sceUtility ---------------------------------------------------------- */
+
+/* The system parameters a game reads before it draws anything: the language its
+ * strings are in, the date and time formats, the timezone, whether the pad is
+ * swapped. LocoRoco asks for several of them on its way into its main loop.
+ *
+ * The values below are the ones this toolkit can stand behind rather than
+ * guesses: no button swap (9), English strings (8, the language these reports
+ * and this toolkit's own messages are in), a 24-hour clock (5) and YYYYMMDD
+ * dates (4), no daylight saving (7), WLAN power save off (3), the ad-hoc channel
+ * on automatic (2) -- and a timezone of 0 (6), which is not a choice at all: it
+ * is the one consistent with the clock this HLE serves, because sceRtc answers
+ * UTC (src/hle/rtc.c). A game told it is at UTC+2 while the clock says UTC is a
+ * game that displays the wrong hour.
+ *
+ * An id this toolkit cannot name is named in the log and refused. Its output
+ * word is still written -- as a defined zero -- because leaving it untouched
+ * hands the guest whatever its own stack held, and a game reads that as a
+ * parameter value; the error code is the part it can check. That is the same
+ * trade as the drive callback: a defined nothing, counted, never a guess. */
+#define PSP_SYSTEMPARAM_ID_INT_ADHOC_CHANNEL    2
+#define PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE   3
+#define PSP_SYSTEMPARAM_ID_INT_DATE_FORMAT      4
+#define PSP_SYSTEMPARAM_ID_INT_TIME_FORMAT      5
+#define PSP_SYSTEMPARAM_ID_INT_TIMEZONE         6
+#define PSP_SYSTEMPARAM_ID_INT_DAYLIGHTSAVINGS  7
+#define PSP_SYSTEMPARAM_ID_INT_LANGUAGE         8
+#define PSP_SYSTEMPARAM_ID_INT_BUTTON_SWAP      9
+
+static void hle_GetSystemParamInt(void) {
+    int32_t  id  = (int32_t)psp_arg(0);
+    uint32_t out = psp_arg(1);
+
+    switch (id) {
+    case PSP_SYSTEMPARAM_ID_INT_ADHOC_CHANNEL:   if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_WLAN_POWERSAVE:  if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_DATE_FORMAT:     if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_TIME_FORMAT:     if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_TIMEZONE:        if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_DAYLIGHTSAVINGS: if (out) psp_write32(out, 0); break;
+    case PSP_SYSTEMPARAM_ID_INT_LANGUAGE:        if (out) psp_write32(out, 1); break;
+    case PSP_SYSTEMPARAM_ID_INT_BUTTON_SWAP:     if (out) psp_write32(out, 0); break;
+    default:
+        g_sysparam_unknown++;
+        if (g_sysparam_unknown == 1)
+            fprintf(stderr,
+                    "psprecomp: sceUtilityGetSystemParamInt(%d) asks for a parameter this toolkit"
+                    " cannot name -- answered 0 and refused, see src/hle/misc.c\n", id);
+        if (out) psp_write32(out, 0);
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+        return;
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_misc_reset(void) {
     /* The interrupt mask is per thread and lives in the scheduler; a reset
      * here cannot reach another thread's bracket, and should not. */
     g_exit_requested = 0;
     g_buttons = 0;
+    g_latch_make = g_latch_break = 0;
+    g_sysparam_unknown = 0;
     g_analog_x = g_analog_y = 128;
     g_ctrl_frame = 0;
     memset(g_audio, 0, sizeof g_audio);
@@ -312,6 +403,9 @@ void psp_misc_register(void) {
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
     psp_hle_register(0x1F803938, "sceCtrl", "sceCtrlReadBufferPositive",  hle_ReadBufferPositive);
+    psp_hle_register(0x0B588501, "sceCtrl", "sceCtrlReadLatch",           hle_ReadLatch);
+
+    psp_hle_register(0xA5DA2406, "sceUtility", "sceUtilityGetSystemParamInt", hle_GetSystemParamInt);
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
