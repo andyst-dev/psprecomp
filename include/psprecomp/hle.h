@@ -121,6 +121,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 #define SCE_KERNEL_ERROR_THREAD_TERMINATED 0x800201AC
 #define SCE_KERNEL_ERROR_SEMA_ZERO       0x800201AD
 #define SCE_KERNEL_ERROR_EVF_COND        0x800201AF
+/* Added for the power callback slots; the neighbouring codes are corrected on
+ * the UMD/RTC branch (their values arrived from the same pspsdk source). */
+#define SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT 0x800200D2
 
 /* ---- the subsystems ------------------------------------------------------ */
 
@@ -197,6 +200,32 @@ uint64_t psp_threadman_vtime_us(void);
 uint64_t psp_threadman_handovers(void);
 uint64_t psp_threadman_handover_expired(void);
 void     psp_threadman_dump(FILE *out);
+
+/* ---- callbacks -----------------------------------------------------------
+ *
+ * A callback runs on the thread that created it, at the points where that
+ * thread waits or explicitly asks (sceKernelCheckCallback) -- not at the point
+ * of the notification, which may be another thread entirely. See the callbacks
+ * section of src/hle/threadman.c. */
+
+/* Whether an id names a callback the guest has actually created. A subsystem
+ * that records a callback id (scePower's slots) has to ask first. */
+int psp_callback_valid(uint32_t uid);
+
+/* What delivery did, for a host's report: callbacks that ran, notifications
+ * dropped because the target is not a recompiled function, and passes that hit
+ * the per-tick ceiling. */
+uint64_t psp_threadman_callback_deliveries(void);
+uint64_t psp_threadman_callback_unresolved(void);
+uint64_t psp_threadman_callback_deferred(void);
+
+/* scePower: the power callback slots. No power event exists in this HLE, so a
+ * registered callback is never fired; what is real is the slot handed back to
+ * the caller. See the header of src/hle/power.c. */
+void     psp_power_init(void);
+void     psp_power_register(void);
+void     psp_power_reset(void);
+uint64_t psp_power_registered(void);
 
 /* InterruptManager: sub-interrupt handlers, and the points where an interrupt
  * is delivered. See the header of src/hle/intrman.c for why a game can be
