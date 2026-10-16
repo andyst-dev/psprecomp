@@ -77,6 +77,38 @@ static uint32_t g_next_id;
 
 static uint64_t g_unsupported;     /* vertices in a format we do not read */
 
+/* Which state commands the guest actually programs, and with which argument.
+ *
+ * The interpreter decodes the flow and the few commands it needs in order to
+ * draw; every other command lands in one bucket. During bring-up the question is
+ * not how many were skipped but WHICH ones, so they are counted per opcode with
+ * the first and last argument seen. They are named only where the toolkit
+ * already knows the name -- an invented name reads like a fact, whereas a number
+ * with its argument is a measurement that can be checked against the guest. The
+ * first run said the guest opens with a zeroing sweep of 0x3B..0x5D, which is
+ * the matrix and viewport block; what they carry later is the question. */
+static uint64_t g_cmd_count[256];
+static uint32_t g_cmd_first[256];
+static uint32_t g_cmd_last[256];
+
+/* The colours the guest actually submits, for the vertex formats that carry one.
+ * "The frame is white" and "the guest sends white" look the same until these are
+ * counted. */
+#define COL_HIST 8
+static uint32_t g_col_val[COL_HIST];
+static uint64_t g_col_count[COL_HIST];
+static uint64_t g_col_total;
+static unsigned g_col_n;
+
+/* Vertices drawn per vertex format. Read against pspsdk's GU_* shifts
+ * (GU_VERTEX_SHIFT(n) = n << 7, GU_COLOR_SHIFT(n) = n << 2, GU_TRANSFORM_2D =
+ * 1 << 23), so a format this toolkit cannot read yet is a count rather than a
+ * guess about what the game is doing. */
+#define VT_HIST 16
+static uint32_t g_vt_val[VT_HIST];
+static uint64_t g_vt_verts[VT_HIST];
+static unsigned g_vt_n;
+
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
     uint32_t fbp, fbw, vtype, vaddr;
@@ -91,6 +123,16 @@ static struct {
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
+    memset(g_cmd_count, 0, sizeof g_cmd_count);
+    memset(g_cmd_first, 0, sizeof g_cmd_first);
+    memset(g_cmd_last, 0, sizeof g_cmd_last);
+    memset(g_vt_val, 0, sizeof g_vt_val);
+    memset(g_vt_verts, 0, sizeof g_vt_verts);
+    memset(g_col_val, 0, sizeof g_col_val);
+    memset(g_col_count, 0, sizeof g_col_count);
+    g_col_total = 0;
+    g_col_n = 0;
+    g_vt_n = 0;
     psp_render_reset_pixels();
     g_unsupported = 0;
     g_next_id = 0x00080000u;
@@ -112,6 +154,13 @@ static void set_ge_target(void) {
     psp_render_current()->set_target(PSP_VRAM_BASE + rel, g_ge.fbw, 0);
 }
 
+uint64_t psp_ge_state_command_count(unsigned cmd, uint32_t *first, uint32_t *last) {
+    if (cmd > 255) return 0;
+    if (first) *first = g_cmd_first[cmd];
+    if (last)  *last  = g_cmd_last[cmd];
+    return g_cmd_count[cmd];
+}
+
 void psp_ge_dump_stats(FILE *out) {
     fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
             (unsigned long long)g_ge.lists,
@@ -123,12 +172,39 @@ void psp_ge_dump_stats(FILE *out) {
     for (int i = 0; i < 8; i++)
         if (g_ge.prims[i])
             fprintf(out, "    %-15s %llu\n", PRIM_NAME[i], (unsigned long long)g_ge.prims[i]);
-    if (g_ge.unknown)
-        fprintf(out, "    %llu commands not individually decoded\n",
+    if (g_ge.unknown) {
+        fprintf(out, "    %llu commands not individually decoded, by opcode "
+                     "(1er et dernier argument) :\n",
                 (unsigned long long)g_ge.unknown);
+        /* TOUS les opcodes vus, dans l'ordre des numeros : un top 10 cache
+         * precisement ceux qui apparaissent une fois par image -- un format, une
+         * taille, une adresse -- c'est-a-dire l'etat qui configure le dessin. */
+        for (unsigned c = 0; c < 256; c++)
+            if (g_cmd_count[c])
+                fprintf(out, "        0x%02X %10llu fois, 1er arg 0x%06X, dernier 0x%06X\n",
+                        c, (unsigned long long)g_cmd_count[c],
+                        g_cmd_first[c], g_cmd_last[c]);
+    }
+    if (g_vt_n) {
+        fprintf(out, "    vertices per vertex format (GU_* shifts: vertex 7, color 2, "
+                     "transform-2D bit 23):\n");
+        for (unsigned i = 0; i < g_vt_n; i++)
+            fprintf(out, "        0x%06X %10llu%s\n", g_vt_val[i],
+                    (unsigned long long)g_vt_verts[i],
+                    ((g_vt_val[i] >> 23) & 1) ? "" : "   (not pass-through: not drawn)");
+    }
+    if (g_col_total) {
+        fprintf(out, "    vertex colours submitted (8888 only; the other formats "
+                     "are not decoded and draw white), %llu au total :\n",
+                (unsigned long long)g_col_total);
+        for (unsigned i = 0; i < g_col_n; i++)
+            fprintf(out, "        0x%08X %10llu\n", g_col_val[i],
+                    (unsigned long long)g_col_count[i]);
+    }
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
     if (g_unsupported)
-        fprintf(out, "    %llu vertices in an unsupported format (transformed, or no position)\n",
+        fprintf(out, "    %llu vertices in a format this interpreter does not process "
+                     "(not pass-through, no position, or no vertex list)\n",
                 (unsigned long long)g_unsupported);
 }
 
@@ -197,11 +273,30 @@ static int vertex_layout(uint32_t vtype, int *col_off, int *pos_off) {
     return (off + align - 1) & ~(align - 1);  /* stride */
 }
 
+/* Les couleurs reellement soumises par l'invite, pour les formats qui en portent
+ * une. « L'image est blanche » et « l'invite envoie du blanc » se ressemblent
+ * exactement jusqu'a ce qu'on les compte. Table pleine : on remplace la couleur
+ * la moins vue, donc le rapport garde les plus frequentes et non les premieres
+ * rencontrees. */
+static void note_colour(uint32_t c) {
+    g_col_total++;
+    for (unsigned i = 0; i < g_col_n; i++)
+        if (g_col_val[i] == c) { g_col_count[i]++; return; }
+    if (g_col_n < COL_HIST) { g_col_val[g_col_n] = c; g_col_count[g_col_n] = 1; g_col_n++; return; }
+    unsigned least = 0;
+    for (unsigned i = 1; i < COL_HIST; i++)
+        if (g_col_count[i] < g_col_count[least]) least = i;
+    g_col_val[least] = c;
+    g_col_count[least] = 1;
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
                        psp_vertex *out) {
     out->rgba = 0xFFFFFFFFu;
-    if (col_off >= 0 && VT_COLOR(vtype) == 7)
+    if (col_off >= 0 && VT_COLOR(vtype) == 7) {
         out->rgba = psp_read32(addr + (uint32_t)col_off);
+        note_colour(out->rgba);
+    }
 
     switch (VT_POS(vtype)) {
     case 2:   /* 16-bit */
@@ -220,6 +315,10 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
 
 
 static void draw_prim(uint32_t type, uint32_t count) {
+    for (unsigned i = 0; i < g_vt_n; i++)
+        if (g_vt_val[i] == g_ge.vtype) { g_vt_verts[i] += count; goto noted; }
+    if (g_vt_n < VT_HIST) { g_vt_val[g_vt_n] = g_ge.vtype; g_vt_verts[g_vt_n] = count; g_vt_n++; }
+noted:
     if (!VT_THROUGH(g_ge.vtype)) { g_unsupported += count; return; }
     if (!g_ge.vaddr) { g_unsupported += count; return; }
 
@@ -355,11 +454,13 @@ static void run_list(ge_queue *q) {
         case GE_IADDR: break;
 
         default:
-            /* A real state command we do not decode individually. Counted --
-             * and, for the first few, named. "240 commands not individually
-             * decoded" hides whether the game is configuring a draw or just
-             * poking state, which is the difference between a rendering bug
-             * and a game that has not asked to render yet. */
+            /* Un vrai changement d'etat que l'interpreteur ne decode pas
+             * individuellement. Compte par opcode avec son premier et son dernier
+             * argument : « N commandes non decodees » cache si l'invite configure
+             * un dessin ou pousse de l'etat, ce qui est la difference entre un
+             * defaut de rendu et un jeu qui n'a pas encore demande a rendre. */
+            if (g_cmd_count[cmd]++ == 0) g_cmd_first[cmd] = arg;
+            g_cmd_last[cmd] = arg;
             if (g_ge.unknown < 64)
                 fprintf(stderr, "  GE cmd 0x%02X arg 0x%06X\n", cmd, arg);
             g_ge.unknown++;

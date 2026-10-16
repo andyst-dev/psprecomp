@@ -149,6 +149,14 @@ void psp_ge_init(void);
 void psp_ge_register(void);
 void psp_ge_reset(void);
 void psp_ge_dump_stats(FILE *out);
+
+/** Combien de fois l'invite a programme une commande d'etat que l'interpreteur
+ *  ne decode pas, et avec quels arguments (premier et dernier vus). C'est
+ *  l'instrument qui a etabli deux faits qu'une image blanche confond : les trois
+ *  formats de sommets de ce titre sont tous en TRANSFORM_2D, donc les matrices
+ *  ne s'appliquent pas a sa geometrie, et ses sommets colores portent
+ *  0x00000000. */
+uint64_t psp_ge_state_command_count(unsigned cmd, uint32_t *first, uint32_t *last);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);

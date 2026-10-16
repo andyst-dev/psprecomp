@@ -1274,6 +1274,20 @@ static void test_ge_target(void) {
               OFFSETS[pass], PSP_VRAM_BASE + OFFSETS[pass], psp_render_target());
     }
     CHECK(psp_render_target() >= PSP_VRAM_BASE, "and never outside VRAM");
+
+    /* L'instrument d'etat doit etre fiable : un rapport qui compte mal envoie
+     * chercher un defaut de rendu la ou il n'y a qu'un jeu qui n'a pas encore
+     * dessine. La commande 0x53 est celle dont la mesure a montre qu'elle porte
+     * un format de texture (dernier argument vu : 7) sur ce titre. */
+    uint32_t first = 0xDEADBEEFu, last = 0xDEADBEEFu;
+    psp_write32(LIST + 0, (0x53u << 24) | 0x7);
+    psp_write32(LIST + 4, (0x0Fu << 24));
+    psp_write32(LIST + 8, (0x0Cu << 24));
+    call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
+    uint64_t n53 = psp_ge_state_command_count(0x53, &first, &last);
+    CHECK(n53 == 1, "the state command 0x53 is counted once, got %llu",
+          (unsigned long long)n53);
+    CHECK(first == 7 && last == 7, "with its argument recorded, got 0x%X/0x%X", first, last);
 }
 
 int main(void) {
