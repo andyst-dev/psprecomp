@@ -181,6 +181,11 @@ int  psp_threadman_intr_disabled(void);
 uint64_t psp_threadman_switches(void);
 uint64_t psp_threadman_parks(void);
 uint64_t psp_threadman_vtime_us(void);
+/* Parks after which another thread had run (so the CPU really was handed over),
+ * and the ones that gave up before the thread they waited for was scheduled.
+ * See the handover in src/hle/threadman.c. */
+uint64_t psp_threadman_handovers(void);
+uint64_t psp_threadman_handover_expired(void);
 void     psp_threadman_dump(FILE *out);
 
 /* InterruptManager: sub-interrupt handlers, and the points where an interrupt

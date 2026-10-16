@@ -303,8 +303,37 @@ static void test_threads(void) {
     g_sleeper_stage = 0;
     CHECK(call(START, sid, 0, 0, 0) == 0, "second thread started");
 
+    /* The delay is a *handover*, not a nap: the CPU is not taken back while a
+     * thread that has been started has never run (nor while one is queued for
+     * the baton). Asserted through the counter rather than hoped for, because
+     * the assertion right after it is only deterministic if the handover
+     * happened -- a park that races the host's own scheduler for the CPU gives
+     * the OS the choice of whether the guest ever sees this thread run, which is
+     * a flake, measured at about one run in ten. */
+    uint64_t handovers = psp_threadman_handovers();
+    uint64_t started = psp_threadman_started();
     call(DELAY, 1000, 0, 0, 0);        /* the caller parks: the sleeper gets in */
-    CHECK(g_sleeper_stage == 1, "the sleeper ran and then blocked on SleepThread");
+    CHECK(psp_threadman_handovers() > handovers,
+          "the delay handed the CPU over to the thread that had not run yet");
+    CHECK(psp_threadman_handover_expired() == 0,
+          "and the handover did not fall back to its cap");
+    /* The numbers are in the message on purpose: if this ever fails again, the
+     * failing run says what it saw instead of needing a second one.
+     *
+     * And it is `>= 1`, not `== 1`: after the handover both threads are runnable,
+     * which is what hardware does too, so the sleeper may legitimately have got
+     * all the way through its sleep before the starter gets the CPU back. What
+     * the delay has to guarantee is that the thread *ran* -- asserting where it
+     * stopped would assert a race between two equal peers, and it was flaking on
+     * exactly that (stage=2, one run in ten) after the handover was in place. */
+    CHECK(g_sleeper_stage >= 1,
+          "the sleeper ran and then blocked on SleepThread (stage=%d, started %llu->%llu,"
+          " handovers %llu->%llu, expired=%llu)",
+          g_sleeper_stage, (unsigned long long)started,
+          (unsigned long long)psp_threadman_started(),
+          (unsigned long long)handovers,
+          (unsigned long long)psp_threadman_handovers(),
+          (unsigned long long)psp_threadman_handover_expired());
 
     /* A sleep with nothing to wake it still ends, one tick later. That is the
      * approximation that keeps a `while (!flag) sleep();` poll alive: the
