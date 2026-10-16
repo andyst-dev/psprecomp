@@ -165,7 +165,15 @@ typedef struct {
     uint32_t uid;
     char     name[32];
     uint32_t func;
-    uint32_t arg;
+    uint32_t arg;          /* what CreateCallback was given: the callback's first argument */
+    /* A callback belongs to the thread that created it, and runs on that thread
+     * -- which is why the owner is part of the object rather than a detail of
+     * delivery: a notify from anywhere else leaves it pending until its own
+     * thread reaches a check point. `0` is the boot thread. */
+    uint32_t owner;
+    uint32_t notify_arg;   /* the argument of the last notification */
+    int      notify_count; /* notifications not yet delivered */
+    int32_t  delivery_status;  /* what the callback returned, as sceKernelReferCallbackStatus reports */
     int      used;
 } psp_callback;
 
@@ -193,6 +201,11 @@ static psp_thread   g_thread[MAX_THREADS];
 static psp_sema     g_sema[MAX_SEMAS];
 static psp_evflag   g_flag[MAX_FLAGS];
 static psp_callback g_cb[MAX_CBS];
+static uint64_t     g_cb_deliveries;        /* callbacks that actually ran */
+static uint64_t     g_cb_unresolved;        /* notifications dropped: not a recompiled function */
+static uint64_t     g_cb_unresolved_logged;
+static uint64_t     g_cb_deliver_deferred;  /* passes that hit the per-tick ceiling */
+static int          g_cb_delivering;        /* re-entrance guard, see deliver_callbacks */
 static psp_vpl       g_vpl[MAX_VPLS];
 static psp_vpl_block g_vplblk[MAX_VPL_BLOCKS];
 static uint32_t     g_next_uid;
@@ -468,6 +481,11 @@ void psp_threadman_reset(void) {
     memset(g_sema, 0, sizeof g_sema);
     memset(g_flag, 0, sizeof g_flag);
     memset(g_cb, 0, sizeof g_cb);
+    g_cb_deliveries = 0;
+    g_cb_unresolved = 0;
+    g_cb_unresolved_logged = 0;
+    g_cb_deliver_deferred = 0;
+    g_cb_delivering = 0;
     memset(g_vpl, 0, sizeof g_vpl);
     memset(g_vplblk, 0, sizeof g_vplblk);
     g_next_uid = UID_BASE;
@@ -491,6 +509,10 @@ void psp_threadman_reset(void) {
 
 void psp_threadman_init(void) { psp_threadman_reset(); trace_sched_enable(); }
 
+/* Delivers the deferred work every wait point owes the guest: an interrupt, and
+ * the callbacks this thread has pending. Defined with the callbacks, below. */
+static void deliver_tick(void);
+
 /* A record for the host thread running the module entry, so that "who am I"
  * and "what is the CPU doing" have answers before any guest thread exists. */
 static void boot_record(void) {
@@ -513,7 +535,7 @@ static void boot_record(void) {
 void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
 
 void psp_threadman_frame_wait(void) {
-    psp_intr_tick();
+    deliver_tick();
     park_for(W_DELAY, FRAME_US);
 }
 
@@ -624,7 +646,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
     uint64_t ticks = 0;
 
     for (;;) {
-        psp_intr_tick();
+        deliver_tick();
         if (ready(ctx)) return SCE_KERNEL_ERROR_OK;
         check_terminated();
         if (deadline && g_vtime_us >= deadline) return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
@@ -821,7 +843,7 @@ static void park_ticks(uint64_t us, int kind) {
  * how long the guest asked to sleep. */
 static void hle_DelayThread(void) {
     park_ticks(psp_arg(0), W_DELAY);
-    psp_intr_tick();
+    deliver_tick();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -839,7 +861,7 @@ static void hle_SleepThread(void) {
 
     if (!already_woken) park_for(W_SLEEP, TICK_US);
     if (t && t->wakeups) t->wakeups--;      /* consume it, pending or fresh */
-    psp_intr_tick();
+    deliver_tick();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1264,7 +1286,107 @@ static void hle_CancelVpl(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* ---- callbacks ----------------------------------------------------------- */
+/* ---- callbacks -----------------------------------------------------------
+ *
+ * A callback is deferred work a thread has asked to run on itself: the guest
+ * creates it, something notifies it, and it runs when its *own* thread next
+ * reaches a point where it can be disturbed -- a wait, or an explicit
+ * sceKernelCheckCallback. That ownership is the whole shape of the mechanism,
+ * and it is why a callback is not an interrupt handler: an interrupt is
+ * delivered to every enabled handler regardless of which thread is running,
+ * while a callback waits for the thread that created it.
+ *
+ * It is also what stopped the game: `sceKernelCheckCallback` came back
+ * unimplemented, so a load loop that checks callbacks between attempts had
+ * nothing to check -- the notification was never delivered because there was no
+ * delivery. LocoRoco is where this was measured: the function is reached from a
+ * failed sceIoOpen, six times over. */
+
+static psp_callback *find_callback(uint32_t id) {
+    for (int i = 0; i < MAX_CBS; i++)
+        if (g_cb[i].used && g_cb[i].uid == id) return &g_cb[i];
+    return NULL;
+}
+
+/* Whether an id names a callback the guest has actually created. A subsystem
+ * that takes a callback id (scePower's slots, and sceUmdUser's drive callback)
+ * has to ask: recording an id that names nothing is how a registration becomes
+ * a lie, and the lie surfaces much later, as a callback that never runs. */
+int psp_callback_valid(uint32_t uid) { return find_callback(uid) != NULL; }
+
+/* One delivery pass over the calling thread's pending callbacks. Returns how
+ * many ran, which is what sceKernelCheckCallback reports as 1 or 0 -- the two
+ * answers a guest uses to decide whether to keep polling.
+ *
+ * Guarded against re-entrance: a callback that notifies another callback (or
+ * itself) must not recurse, or a game with a self-notifying callback would eat
+ * the host stack instead of running. Not delivered inside a critical section
+ * either -- the guest has said what it is doing cannot be disturbed, and this is
+ * the same rule the interrupt path follows. */
+#define CB_DELIVER_MAX 16
+static int deliver_callbacks(void) {
+    if (g_cb_delivering) return 0;
+    if (psp_threadman_intr_disabled()) return 0;
+
+    uint32_t me = g_tls_me ? g_tls_me->uid : 0;
+    int ran = 0;
+    g_cb_delivering = 1;
+
+    for (int i = 0; i < MAX_CBS && ran < CB_DELIVER_MAX; i++) {
+        psp_callback *c = &g_cb[i];
+        if (!c->used || !c->notify_count || c->owner != me) continue;
+
+        /* The function pointer is a guest address: a callback the discovery
+         * never found cannot be called, and saying so is the difference between
+         * a missing function and a delivery that silently did nothing. */
+        if (!psp_lookup(c->func)) {
+            g_cb_unresolved++;
+            if (g_cb_unresolved_logged < 4) {
+                g_cb_unresolved_logged++;
+                fprintf(stderr,
+                        "psprecomp: callback '%s' (uid %u) points at 0x%08X, which is not a"
+                        " recompiled function -- notification dropped\n",
+                        c->name, c->uid, c->func);
+            }
+            c->notify_count = 0;
+            continue;
+        }
+
+        uint32_t arg = c->notify_arg;
+        c->notify_count--;
+        c->notify_arg = 0;
+
+        /* A real callback does not disturb what it interrupted, so the whole
+         * register file is saved and restored around it -- the same contract as
+         * an interrupt handler, and the same one a thread body gets on entry. */
+        psp_cpu_state saved = psp_cpu;
+        psp_cpu.r[PSP_REG_A0] = c->arg;      /* what the guest passed at create time */
+        psp_cpu.r[PSP_REG_A1] = arg;         /* and what the notification carried */
+        psp_cpu.r[PSP_REG_RA] = 0;
+        psp_dispatch(c->func);
+        c->delivery_status = (int32_t)psp_cpu.r[PSP_REG_V0];
+        psp_cpu = saved;
+
+        g_cb_deliveries++;
+        ran++;
+    }
+
+    /* Anything left over is a notification we could not deliver in one pass:
+     * counted, so a callback that keeps re-arming itself is visible rather than
+     * silently dropped. */
+    if (ran == CB_DELIVER_MAX) g_cb_deliver_deferred++;
+
+    g_cb_delivering = 0;
+    return ran;
+}
+
+/* Called at every point where the guest waits, next to the interrupt delivery:
+ * "time passes, another thread runs, deferred work may run" is one thing, and
+ * the five wait points must not drift apart on it. */
+static void deliver_tick(void) {
+    psp_intr_tick();
+    deliver_callbacks();
+}
 
 static void hle_CreateCallback(void) {
     psp_callback *c = NULL;
@@ -1273,27 +1395,40 @@ static void hle_CreateCallback(void) {
 
     memset(c, 0, sizeof *c);
     psp_str(psp_arg(0), c->name, sizeof c->name);
-    c->func = psp_arg(1);
-    c->arg  = psp_arg(2);
-    c->uid  = g_next_uid++;
-    c->used = 1;
-    /* Registered but never fired: callbacks are delivered by the scheduler at
-     * the points where it already gives the CPU away, which is not implemented
-     * yet. A game that only registers them (the common case -- exit and power
-     * callbacks) is unaffected. */
+    c->func  = psp_arg(1);
+    c->arg   = psp_arg(2);
+    c->owner = g_tls_me ? g_tls_me->uid : 0;
+    c->uid   = g_next_uid++;
+    c->used  = 1;
     psp_ret(c->uid);
 }
 
 static void hle_DeleteCallback(void) {
-    for (int i = 0; i < MAX_CBS; i++) {
-        if (g_cb[i].used && g_cb[i].uid == psp_arg(0)) {
-            g_cb[i].used = 0;
-            psp_ret(SCE_KERNEL_ERROR_OK);
-            return;
-        }
-    }
-    psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);
+    psp_callback *c = find_callback(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    c->used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+static void hle_NotifyCallback(void) {
+    /* (cbid, arg2). Queues work on the callback's own thread; it does not run
+     * here, because "here" may be another thread entirely. */
+    psp_callback *c = find_callback(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    c->notify_arg = psp_arg(1);
+    if (c->notify_count < 0x7FFFFFFF) c->notify_count++;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_CheckCallback(void) {
+    /* The explicit check point, and the one a game uses to decide whether to
+     * keep polling: 1 if a callback ran, 0 if none was pending. */
+    psp_ret(deliver_callbacks() ? 1u : 0u);
+}
+
+uint64_t psp_threadman_callback_deliveries(void) { return g_cb_deliveries; }
+uint64_t psp_threadman_callback_unresolved(void) { return g_cb_unresolved; }
+uint64_t psp_threadman_callback_deferred(void) { return g_cb_deliver_deferred; }
 
 uint64_t psp_threadman_created(void) { return g_created; }
 uint64_t psp_threadman_started(void) { return g_started; }
@@ -1352,4 +1487,6 @@ void psp_threadman_register(void) {
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
+    psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
+    psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
 }
