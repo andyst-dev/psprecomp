@@ -828,6 +828,139 @@ static void test_callbacks(void) {
           (unsigned long long)psp_power_registered());
 }
 
+/* ---- sceUmdUser ---------------------------------------------------------- */
+
+static void test_umd(void) {
+    psp_umd_reset();
+    psp_threadman_reset();
+
+    const uint32_t ACTIVATE   = psp_nid("sceUmdActivate");
+    const uint32_t DEACTIVATE = psp_nid("sceUmdDeactivate");
+    const uint32_t GETSTAT    = psp_nid("sceUmdGetDriveStat");
+    const uint32_t WAITSTAT   = psp_nid("sceUmdWaitDriveStat");
+    const uint32_t CANCEL     = psp_nid("sceUmdCancelWaitDriveStat");
+    const uint32_t REGISTER   = psp_nid("sceUmdRegisterUMDCallBack");
+    const uint32_t UNREGISTER = psp_nid("sceUmdUnRegisterUMDCallBack");
+    const uint32_t MKCALLBACK = psp_nid("sceKernelCreateCallback");
+
+    const uint32_t DRIVE = 0x0880F000u;    /* guest memory, inside RAM */
+    const uint32_t OTHER = 0x0880F020u;
+    const uint32_t CBNAME = 0x0880F040u;
+    const char *disc0 = "disc0:", *other = "ms0:", *cbname = "umd";
+    for (uint32_t i = 0; i <= strlen(disc0); i++) psp_write8(DRIVE + i, (uint8_t)disc0[i]);
+    for (uint32_t i = 0; i <= strlen(other); i++) psp_write8(OTHER + i, (uint8_t)other[i]);
+    for (uint32_t i = 0; i <= strlen(cbname); i++) psp_write8(CBNAME + i, (uint8_t)cbname[i]);
+
+    /* A disc is in the drive before anything activates it, and the drive is not
+     * ready. Both halves matter: a title that reads the state first must not be
+     * told the medium is missing, because it would then wait for a disc this
+     * toolkit cannot insert. */
+    uint32_t stat = call(GETSTAT, 0, 0, 0, 0);
+    CHECK((stat & 0x02) != 0, "the disc is present before activation, stat 0x%02X", stat);
+    CHECK((stat & 0x20) == 0, "and the drive is not ready yet, stat 0x%02X", stat);
+
+    CHECK(call(ACTIVATE, 1, OTHER, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "a mount point that is not disc0: is refused");
+    CHECK(call(ACTIVATE, 0, DRIVE, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "and so is a unit outside 1..2");
+    CHECK(call(ACTIVATE, 1, DRIVE, 0, 0) == 0, "activation succeeds");
+
+    stat = call(GETSTAT, 0, 0, 0, 0);
+    CHECK(stat == 0x32, "an activated drive reports 0x32, got 0x%02X", stat);
+
+    /* The masks a real title tests, all five, against that one value. */
+    CHECK((stat & 0x20) != 0, "0x20 (ready) is set");
+    CHECK((stat & 0x30) != 0, "0x30 (inited|ready) is set");
+    CHECK((stat & 0x02) != 0, "0x02 (present) is set");
+    CHECK((stat & 0x10) != 0, "0x10 (inited) is set");
+    CHECK((stat & 0x0D) == 0, "0x0D (absent|changed|initing) is not -- the disc is not spinning up");
+
+    /* A wait the state already satisfies returns without parking anything. */
+    uint64_t parks = psp_threadman_parks();
+    CHECK(call(WAITSTAT, 0x20, 0, 0, 0) == 0, "a wait already satisfied succeeds");
+    CHECK(psp_threadman_parks() == parks, "and does not park the thread");
+
+    /* A wait this model can never satisfy still returns -- the faithful version
+     * is a thread that never wakes, which is a run with no evidence in it -- and
+     * it is counted, so a run with no log can still say that it happened. */
+    uint64_t never = psp_umd_unsatisfied_waits();
+    CHECK(call(WAITSTAT, 0x01, 0, 0, 0) == 0, "a wait for an absent disc returns");
+    CHECK(psp_umd_unsatisfied_waits() == never + 1, "and is counted");
+
+    /* A wait naming something that is not a drive state is a bad argument, not
+     * a wait that quietly continues. */
+    CHECK(call(WAITSTAT, 0x80, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "a wait for a non-state is refused");
+
+    /* The registered callback has to be a callback. An id the guest never
+     * created is refused, because a game told otherwise would wait for events
+     * that cannot come and believe its registration worked. */
+    CHECK(call(REGISTER, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "registering an id that is not a callback is refused");
+
+    uint32_t cb = call(MKCALLBACK, CBNAME, 0x08801000u, 0, 0);
+    CHECK(cb != 0, "a callback is created, got 0x%08X", cb);
+    CHECK(call(REGISTER, cb, 0, 0, 0) == 0, "and registered");
+    CHECK(call(UNREGISTER, cb + 1, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "un-registering a different id is refused");
+    CHECK(call(UNREGISTER, cb, 0, 0, 0) == 0, "un-registering the registered one succeeds");
+    CHECK(call(UNREGISTER, cb, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "and there is only ever one registered");
+
+    CHECK(call(CANCEL, 0, 0, 0, 0) == 0, "cancel is answered, with nothing to cancel");
+
+    CHECK(call(DEACTIVATE, 99, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
+          "deactivating an impossible unit is refused");
+    CHECK(call(DEACTIVATE, 1, 0, 0, 0) == 0, "deactivation succeeds");
+    CHECK(call(GETSTAT, 0, 0, 0, 0) == 0x12, "and the drive is back to present, not ready");
+}
+
+/* ---- sceRtc -------------------------------------------------------------- */
+
+static void test_rtc(void) {
+    psp_rtc_init();          /* the base comes from the host clock, as at startup */
+    psp_threadman_reset();
+
+    const uint32_t TICK = psp_nid("sceRtcGetCurrentTick");
+    const uint32_t RES  = psp_nid("sceRtcGetTickResolution");
+    const uint32_t DELAY = psp_nid("sceKernelDelayThread");
+
+    CHECK(call(RES, 0, 0, 0, 0) == 1000000, "the tick resolution is one microsecond");
+
+    const uint32_t OUT = 0x0880F080u;
+    psp_write32(OUT, 0xDEADBEEFu);
+    psp_write32(OUT + 4, 0xDEADBEEFu);
+
+    uint64_t served = psp_rtc_ticks();
+    CHECK(call(TICK, OUT, 0, 0, 0) == 0, "reading the tick succeeds");
+    CHECK(psp_rtc_ticks() == served + 1, "and is counted");
+
+    /* The value is a *date*, not a duration: the epoch offset is what makes it
+     * one, and both halves of the 64-bit tick have to be written. A tick of a
+     * bare virtual time would pass every check below except this one. */
+    uint64_t tick = ((uint64_t)psp_read32(OUT + 4) << 32) | psp_read32(OUT);
+    CHECK(tick >= 62135596800000000ull,
+          "the tick counts from 0001-01-01: got %llu", (unsigned long long)tick);
+    CHECK((tick / 1000000ull) > 1600000000ull, "so it is a plausible date");
+    CHECK(tick == psp_rtc_last_tick(), "and it is the value the runtime recorded");
+
+    /* It advances with the run. A frozen clock is not neutral: a title that
+     * seeds from the clock or measures an interval gets a constant. */
+    uint64_t before = tick;
+    call(DELAY, 1000, 0, 0, 0);
+    call(TICK, OUT, 0, 0, 0);
+    CHECK(psp_rtc_last_tick() > before, "the tick advances with the run: %llu -> %llu",
+          (unsigned long long)before, (unsigned long long)psp_rtc_last_tick());
+
+    /* A null pointer is a game asking for a tick it does not want, and it is
+     * answered rather than written through: address zero is mapped in this
+     * toolkit -- it is where a PRX links -- so a blind write there would edit a
+     * module image instead of failing. */
+    const uint64_t was = psp_rtc_ticks();
+    CHECK(call(TICK, 0, 0, 0, 0) == 0, "a null destination is answered, not written through");
+    CHECK(psp_rtc_ticks() == was + 1, "and still counts as a call served");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -850,6 +983,8 @@ int main(void) {
     test_display();
     test_sub_interrupts();
     test_callbacks();
+    test_umd();
+    test_rtc();
     test_unimplemented_logging();
 
     psp_mem_free();

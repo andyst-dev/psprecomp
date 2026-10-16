@@ -109,10 +109,10 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 /* Only the ones the implemented functions can actually return. Games branch on
  * these, so returning a plausible-looking wrong value is worse than failing.
  *
- * The numbers are pspsdk's `pspkerror.h`, which is why they are written next to
- * their names. Three of them used to be wrong here -- UNKNOWN_UID,
- * ILLEGAL_MEMBLOCK and ILLEGAL_ADDR -- and the mistake was invisible, because
- * the tests compare a return against the *name*, and a name with a wrong number
+ * The numbers are pspsdk's `pspkerror.h`, which is the reason they are written
+ * next to their names: three of them used to be wrong here (UNKNOWN_UID,
+ * ILLEGAL_MEMBLOCK and ILLEGAL_ADDR) and the mistake was invisible, because the
+ * tests compare a return against the *name* and a name with a wrong number
  * compares fine against itself. A plausible-looking constant is exactly the
  * failure this toolkit exists to catch, so it is verified against the source
  * rather than remembered. */
@@ -165,6 +165,23 @@ void psp_io_reset(void);
 void psp_io_set_root(const char *root);
 uint64_t psp_io_bytes_read(void);
 
+/* The UMD drive: a state machine and nothing about the medium, because a
+ * game's reads come through sceIo. See src/hle/umd.c -- in particular for why
+ * a disc is present by construction, and what happens to a wait this model
+ * cannot satisfy. */
+void     psp_umd_init(void);
+void     psp_umd_register(void);
+void     psp_umd_reset(void);
+uint32_t psp_umd_drive_stat(void);      /* what a guest would read right now */
+uint64_t psp_umd_unsatisfied_waits(void);
+
+/* sceRtc: microseconds since 0001-01-01, advancing with the run. */
+void     psp_rtc_init(void);
+void     psp_rtc_register(void);
+void     psp_rtc_reset(void);
+uint64_t psp_rtc_ticks(void);       /* how many ticks the guest has read */
+uint64_t psp_rtc_last_tick(void);
+
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);
@@ -175,6 +192,10 @@ uint64_t psp_audio_blocks(void);
 void psp_threadman_init(void);
 void psp_threadman_register(void);
 void psp_threadman_reset(void);
+
+/* Whether an id names a callback the guest has created, for the subsystems that
+ * take a callback id (sceUmdUser registers one). See src/hle/threadman.c. */
+int psp_callback_valid(uint32_t uid);
 
 /* ---- the scheduler -------------------------------------------------------
  *

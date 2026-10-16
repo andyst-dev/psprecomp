@@ -48,6 +48,8 @@ add_library(psprecomp STATIC
     src/hle/ge.c
     src/hle/sascore.c
     src/hle/iofilemgr.c
+    src/hle/umd.c
+    src/hle/rtc.c
     src/hle/misc.c
 )
 
