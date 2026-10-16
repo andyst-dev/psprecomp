@@ -804,6 +804,136 @@ static void test_rtc(void) {
     CHECK(psp_rtc_ticks() == was + 1, "and still counts as a call served");
 }
 
+/* ---- callbacks ----------------------------------------------------------- */
+
+/* A callback, as the guest sees one: it is called with two arguments, and it
+ * must not disturb the thread it runs on. */
+static uint32_t g_cb_arg, g_cb_notify;
+static int      g_cb_calls;
+static void fake_callback(void) {
+    g_cb_calls++;
+    g_cb_arg    = psp_cpu.r[PSP_REG_A0];
+    g_cb_notify = psp_cpu.r[PSP_REG_A1];
+    psp_cpu.r[PSP_REG_S3] = 0xDEAD;    /* a register the interrupted code owns */
+    psp_cpu.r[PSP_REG_V0] = 0x42;      /* the delivery status the kernel keeps */
+}
+
+/* And a thread that is handed a callback id belonging to another thread: it
+ * notifies it, and checks -- and must find nothing of its own to run. */
+static uint32_t g_boot_cbid;      /* created by the test's own thread */
+static uint32_t g_other_ran;      /* what the other thread's check reported */
+static uint32_t g_other_delta;    /* deliveries its check caused */
+static void fake_other_thread(void) {
+    call(psp_nid("sceKernelNotifyCallback"), g_boot_cbid, 0x99, 0, 0);
+    uint32_t before = (uint32_t)g_cb_calls;
+    g_other_ran = call(psp_nid("sceKernelCheckCallback"), 0, 0, 0, 0);
+    g_other_delta = (uint32_t)g_cb_calls - before;
+}
+
+static void test_callbacks(void) {
+    psp_threadman_reset();
+    psp_power_reset();
+    psp_dispatch_reset();
+
+    const uint32_t CREATE = psp_nid("sceKernelCreateCallback");
+    const uint32_t NOTIFY = psp_nid("sceKernelNotifyCallback");
+    const uint32_t CHECK  = psp_nid("sceKernelCheckCallback");
+    const uint32_t DELETE = psp_nid("sceKernelDeleteCallback");
+    const uint32_t DELAY  = psp_nid("sceKernelDelayThread");
+    const uint32_t PWREG  = psp_nid("scePowerRegisterCallback");
+    const uint32_t PWUNREG= psp_nid("scePowerUnregisterCallback");
+    const uint32_t START  = psp_nid("sceKernelStartThread");
+    const uint32_t END    = psp_nid("sceKernelWaitThreadEnd");
+    const uint32_t CREATE_TH = psp_nid("sceKernelCreateThread");
+
+    const uint32_t FN = 0x08803000u;
+    psp_register(FN, fake_callback);
+
+    /* Nothing pending is the answer a polling loop gets while it has no work:
+     * 0, distinctly not an error. */
+    CHECK(call(CHECK, 0, 0, 0, 0) == 0, "no callback pending -> CheckCallback reports 0");
+
+    uint32_t cbid = call(CREATE, 0 /*name*/, FN, 0xAA /*arg*/, 0);
+    CHECK(cbid != 0, "callback created, got 0x%08X", cbid);
+
+    /* A notification queues, it does not run in place: the notify may well come
+     * from another thread, and the callback belongs to its own. */
+    g_cb_calls = 0;
+    CHECK(call(NOTIFY, cbid, 0x77, 0, 0) == 0, "notify succeeds");
+    CHECK(g_cb_calls == 0, "a notification does not run the callback in place");
+
+    /* The check point runs it, with the argument from create time and the one
+     * the notification carried, and reports 1 -- one callback ran. */
+    psp_cpu.r[PSP_REG_S3] = 0x5A5A5A5A;
+    CHECK(call(CHECK, 0, 0, 0, 0) == 1, "CheckCallback reports 1 when a callback ran");
+    CHECK(g_cb_calls == 1, "the callback ran once, got %d", g_cb_calls);
+    CHECK(g_cb_arg == 0xAA, "first argument is the one CreateCallback was given, got 0x%X", g_cb_arg);
+    CHECK(g_cb_notify == 0x77, "second argument is the one the notification carried, got 0x%X", g_cb_notify);
+    CHECK(psp_cpu.r[PSP_REG_S3] == 0x5A5A5A5A, "a callback does not disturb the thread it runs on");
+
+    /* One delivery per notification. */
+    CHECK(call(CHECK, 0, 0, 0, 0) == 0, "a delivered notification is not delivered twice");
+
+    /* And the waits deliver too, next to the interrupt delivery: a game that
+     * polls by sleeping rather than by checking must still see it. */
+    g_cb_calls = 0;
+    call(NOTIFY, cbid, 0x11, 0, 0);
+    call(DELAY, 1000, 0, 0, 0);
+    CHECK(g_cb_calls == 1, "a wait delivers the callback, got %d", g_cb_calls);
+
+    /* An id that names nothing is refused rather than recorded: a registration
+     * that accepts one is a callback that never runs for no visible reason. */
+    CHECK(call(NOTIFY, 0xDEADBEEFu, 0, 0, 0) != 0, "notifying an unknown id fails");
+
+    /* Ownership, both ways round: a callback runs only on the thread that
+     * created it. The second thread notifies the first thread's callback and
+     * then checks -- the notification queues, its own check finds nothing to
+     * run, and the work is still there for the thread it belongs to. */
+    g_cb_calls = 0;
+    g_boot_cbid = call(CREATE, 0, FN, 0xBB, 0);
+    call(NOTIFY, g_boot_cbid, 0x22, 0, 0);
+    const uint32_t OTHER = 0x08803100u;
+    g_other_ran = 0xFFFFFFFFu;
+    g_other_delta = 0xFFFFFFFFu;
+    psp_register(OTHER, fake_other_thread);
+    uint32_t oid = call5(CREATE_TH, 0, OTHER, 32, 0x4000, 0);
+    CHECK(call(START, oid, 0, 0, 0) == 0, "notifying thread started");
+    CHECK(call(END, oid, 0x08804000u, 0, 0) == 0, "notifying thread ended");
+    CHECK(g_other_ran == 0, "another thread's check runs nothing of this thread's (got %u)",
+          g_other_ran);
+    CHECK(g_other_delta == 0, "and does not deliver it on the way (delta %u)", g_other_delta);
+    /* The owner delivered -- once per notification it was given -- and the last
+     * one carried the argument the *other* thread passed. */
+    CHECK(g_cb_calls == 2, "the owner delivered both notifications, got %d", g_cb_calls);
+    CHECK(g_cb_notify == 0x99, "the last one carried the other thread's argument, got 0x%X",
+          g_cb_notify);
+    CHECK(g_cb_arg == 0xBB, "and the callback still sees what create time gave it, got 0x%X",
+          g_cb_arg);
+    CHECK(call(CHECK, 0, 0, 0, 0) == 0, "and nothing is left pending");
+
+    /* A deleted callback cannot be notified. */
+    CHECK(call(DELETE, cbid, 0, 0, 0) == 0, "delete succeeds");
+    CHECK(call(NOTIFY, cbid, 0, 0, 0) != 0, "a deleted callback cannot be notified");
+    CHECK(call(DELETE, cbid, 0, 0, 0) != 0, "and deleting it twice fails");
+
+    /* Power callback slots. No power event exists in this HLE, so what is real
+     * is the slot: the caller passes -1, stores what comes back, and passes it
+     * to unregister later. */
+    CHECK(call(PWREG, (uint32_t)-1, 0xDEADBEEFu, 0, 0) != 0,
+          "a slot is not given to an id that is not a callback");
+    uint32_t cbid3 = call(CREATE, 0, FN, 0, 0);
+    int32_t slot_a = (int32_t)call(PWREG, (uint32_t)-1, cbid3, 0, 0);
+    CHECK(slot_a >= 0 && slot_a < 16, "auto slot is a real slot number, got %d", slot_a);
+    int32_t slot_b = (int32_t)call(PWREG, (uint32_t)-1, cbid3, 0, 0);
+    CHECK(slot_b >= 0 && slot_b != slot_a, "a second registration gets another slot, got %d", slot_b);
+    CHECK(call(PWREG, (uint32_t)slot_a, cbid3, 0, 0) != 0, "a taken slot is refused, not overwritten");
+    CHECK(call(PWREG, 99, cbid3, 0, 0) != 0, "a slot out of range is refused");
+    CHECK(call(PWUNREG, (uint32_t)slot_a, 0, 0, 0) == 0, "unregister succeeds");
+    CHECK((int32_t)call(PWREG, (uint32_t)-1, cbid3, 0, 0) == slot_a, "the freed slot is reused");
+    CHECK(psp_power_registered() == 3, "three registrations succeeded, got %llu",
+          (unsigned long long)psp_power_registered());
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -828,6 +958,7 @@ int main(void) {
     test_umd();
     test_rtc();
     test_unimplemented_logging();
+    test_callbacks();
 
     psp_mem_free();
 

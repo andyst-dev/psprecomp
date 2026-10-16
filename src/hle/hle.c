@@ -208,4 +208,6 @@ void psp_hle_init(void) {
     psp_rtc_register();
     psp_misc_init();
     psp_misc_register();
+    psp_power_init();
+    psp_power_register();
 }
