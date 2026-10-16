@@ -186,9 +186,13 @@ void     psp_rtc_reset(void);
 uint64_t psp_rtc_ticks(void);       /* how many ticks the guest has read */
 uint64_t psp_rtc_last_tick(void);
 
-void psp_misc_init(void);
-void psp_misc_register(void);
-void psp_misc_reset(void);
+void     psp_misc_init(void);
+void     psp_misc_register(void);
+void     psp_misc_reset(void);
+/* Modules the guest asked to load. They are reported resident rather than
+ * loaded (Media Engine code a user-space recompilation cannot run), so this is
+ * what says whether a title went down that path at all. See src/hle/misc.c. */
+uint64_t psp_modules_loaded(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);

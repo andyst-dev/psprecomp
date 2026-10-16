@@ -351,6 +351,46 @@ static void hle_GetSystemParamInt(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- ModuleMgr ------------------------------------------------------------
+ *
+ * The game loads Sony's own PRXs at startup -- audiocodec, libatrac3plus,
+ * libfont, psmfplayer, mpeg, videocodec, sascore -- and LocoRoco reaches
+ * sceKernelLoadModule eight times. None of them is loaded here, and that is an
+ * answer rather than a gap: they are Media Engine code and kernel libraries that
+ * a user-space recompilation can neither run nor usefully map, and a game only
+ * ever uses them through their *imports*, which are HLE'd (or missing, and then
+ * named). What the game needs from this path is a module id it will hand to
+ * sceKernelStartModule, so that is what it gets: a real id, never zero, because
+ * zero in this family reads as either an error or "module 0". Each distinct path
+ * is named once, so a run says which modules a title wants.
+ *
+ * sceKernelSelfStopUnloadModule is the module saying "stop and unload me". Since
+ * nothing was loaded and the caller has no id to give, answering success is the
+ * whole of it. */
+static uint64_t g_module_next_id = 0x40000;
+static uint64_t g_modules_loaded;
+static char     g_module_seen[8][64];
+static int      g_module_seen_n;
+
+uint64_t psp_modules_loaded(void) { return g_modules_loaded; }
+
+static void hle_LoadModule(void) {
+    char path[64];
+    psp_str(psp_arg(0), path, sizeof path);
+
+    int seen = 0;
+    for (int i = 0; i < g_module_seen_n; i++) if (!strcmp(g_module_seen[i], path)) seen = 1;
+    if (!seen && g_module_seen_n < 8) {
+        snprintf(g_module_seen[g_module_seen_n++], 64, "%s", path);
+        fprintf(stderr, "psprecomp: sceKernelLoadModule(\"%s\") -- reported resident,"
+                        " see src/hle/misc.c\n", path);
+    }
+    g_modules_loaded++;
+    psp_ret((uint32_t)g_module_next_id++);
+}
+
+static void hle_SelfStopUnloadModule(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_misc_reset(void) {
     /* The interrupt mask is per thread and lives in the scheduler; a reset
      * here cannot reach another thread's bracket, and should not. */
@@ -358,6 +398,8 @@ void psp_misc_reset(void) {
     g_buttons = 0;
     g_latch_make = g_latch_break = 0;
     g_sysparam_unknown = 0;
+    g_modules_loaded = 0;
+    g_module_seen_n = 0;
     g_analog_x = g_analog_y = 128;
     g_ctrl_frame = 0;
     memset(g_audio, 0, sizeof g_audio);
@@ -399,6 +441,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x50F0C1EC, "ModuleMgrForUser", "sceKernelStartModule",          hle_ModuleOk);
     psp_hle_register(0xD1FF982A, "ModuleMgrForUser", "sceKernelStopModule",           hle_ModuleOk);
     psp_hle_register(0x2E0911AA, "ModuleMgrForUser", "sceKernelUnloadModule",         hle_ModuleOk);
+    psp_hle_register(0x977DE386, "ModuleMgrForUser", "sceKernelLoadModule",           hle_LoadModule);
+    psp_hle_register(0xD675EBB8, "ModuleMgrForUser", "sceKernelSelfStopUnloadModule", hle_SelfStopUnloadModule);
 
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);

@@ -1209,6 +1209,23 @@ static void test_main_loop_calls(void) {
     psp_write32(OUT_P, 0xDEADBEEFu);
     CHECK(call(SYSPARAM, 11, OUT_P, 0, 0) != 0, "a parameter this toolkit cannot name is refused");
     CHECK(psp_read32(OUT_P) == 0, "and its word is written as a defined nothing, not left as garbage");
+
+    /* Modules: Sony's own PRXs, which are reported resident rather than loaded.
+     * What the game needs from this call is an id it will hand to StartModule --
+     * and zero in this family reads as an error or as "module 0", so a real id is
+     * the only usable answer. */
+    const uint32_t LOADM = psp_nid("sceKernelLoadModule");
+    const uint32_t SELFM = psp_nid("sceKernelSelfStopUnloadModule");
+    const uint32_t MNAME = 0x0880B400u;
+    const char *mp = "disc0:/PSP_GAME/USRDIR/modules/libatrac3plus.prx";
+    for (uint32_t i = 0; i <= strlen(mp); i++) psp_write8(MNAME + i, (uint8_t)mp[i]);
+    uint32_t m1 = call(LOADM, MNAME, 0, 0, 0);
+    uint32_t m2 = call(LOADM, MNAME, 0, 0, 0);
+    CHECK(m1 != 0 && m2 != 0, "a module load answers with an id, got 0x%X then 0x%X", m1, m2);
+    CHECK(m1 != m2, "and each load gets its own");
+    CHECK(call(SELFM, 0, 0, 0, 0) == 0, "a module asking to stop and unload itself is answered");
+    CHECK(psp_modules_loaded() == 2, "and the loads are counted, got %llu",
+          (unsigned long long)psp_modules_loaded());
 }
 
 int main(void) {
