@@ -65,4 +65,10 @@ extern const psp_render_backend psp_render_null;
 uint64_t psp_render_pixels(void);
 void     psp_render_reset_pixels(void);
 
+/* The address the active backend is drawing into, in *guest* addresses. It is the
+ * one property a black screen hides: a target of 0 with a display buffer at
+ * 0x04000000 draws 138 774 pixels over the module image while the screen stays
+ * black, and only the address says which. */
+uint32_t psp_render_target(void);
+
 #endif

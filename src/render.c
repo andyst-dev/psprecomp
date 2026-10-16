@@ -33,6 +33,8 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_stride = stride;
 }
 
+uint32_t psp_render_target(void) { return g_fb_addr; }
+
 static void put_pixel(int x, int y, uint32_t rgba) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < 0 || y < 0 || x >= 480 || y >= 272) return;

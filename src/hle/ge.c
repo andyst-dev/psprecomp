@@ -98,6 +98,20 @@ void psp_ge_reset(void) {
 
 void psp_ge_init(void) { psp_ge_reset(); }
 
+/* Hand the backend the framebuffer being drawn into, in *guest* addresses.
+ *
+ * The GE's own frame addresses are offsets inside eDRAM (FBP 0 is the first byte
+ * of VRAM), so they become guest addresses by adding the VRAM window the guest
+ * maps -- the same base its sceGeEdramGetAddr answers and the one it passes to
+ * sceDisplaySetFrameBuf. Passing the raw offset is not a cosmetic error:
+ * measured on LocoRoco, the game drew with FBP 0 while its display buffer was
+ * 0x04000000, and 138 774 pixels were written at 0x00000000 -- over the module
+ * image -- with a black screen. */
+static void set_ge_target(void) {
+    uint32_t rel = g_ge.fbp & 0x00FFFFFFu;
+    psp_render_current()->set_target(PSP_VRAM_BASE + rel, g_ge.fbw, 0);
+}
+
 void psp_ge_dump_stats(FILE *out) {
     fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
             (unsigned long long)g_ge.lists,
@@ -320,14 +334,21 @@ static void run_list(ge_queue *q) {
         case GE_OFFSET_ADDR: q->base = arg << 8; break;
 
         case GE_VTYPE: g_ge.vtype = arg; break;
+        /* The GE's frame addresses are *offsets inside eDRAM*: FBP 0 is the first
+         * byte of VRAM, which the guest maps at PSP_VRAM_BASE -- the address its
+         * own sceGeEdramGetAddr answers and the one it passes to
+         * sceDisplaySetFrameBuf. Geometry drawn with the raw offset lands at
+         * 0x00000000, i.e. over the module image, while the screen stays black.
+         * Measured before this: the game set FBP 0 with its display buffer at
+         * 0x04000000, and 138 774 pixels went into the bottom of the module. */
         case GE_FBP:
             g_ge.fbp = (g_ge.fbp & 0xFF000000u) | arg;
-            psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
+            set_ge_target();
             break;
         case GE_FBW:
             g_ge.fbw = arg & 0xFFFF;
             g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
-            psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
+            set_ge_target();
             break;
 
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
@@ -371,9 +392,17 @@ static void enqueue(int head) {
     /* Hardware runs the list asynchronously. We run it here and finish before
      * returning, which is indistinguishable from the game's point of view
      * because every way it can observe progress -- ListSync, DrawSync -- then
-     * reports completion. */
+     * reports completion.
+     *
+     * Which is also why the slot is released here: holding it would cap a title
+     * at MAX_QUEUES lists *for the whole run*, and every later enqueue would
+     * fail. Measured on LocoRoco: the run reported exactly 8 lists -- the size of
+     * this table -- and the 9th enqueue returned an error the game cannot see,
+     * so it would simply stop drawing. A game re-enqueues once per frame. */
     run_list(q);
-    psp_ret(q->id);
+    uint32_t id = q->id;
+    q->used = 0;
+    psp_ret(id);
 }
 
 static void hle_ListEnQueue(void)     { enqueue(0); }

@@ -11,6 +11,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
+#include "psprecomp/render.h"
 #include "crypto/sha1.h"
 
 #include <stdio.h>
@@ -1228,6 +1229,53 @@ static void test_main_loop_calls(void) {
           (unsigned long long)psp_modules_loaded());
 }
 
+/* ---- la cible de la GE --------------------------------------------------- */
+
+/* Les adresses de cadre de la GE sont des offsets DANS l'eDRAM : FBP 0 est le
+ * premier octet du VRAM, que l'invite mappe a 0x04000000 (c'est ce que repond
+ * son propre sceGeEdramGetAddr et ce qu'il passe a sceDisplaySetFrameBuf).
+ * Passer l'offset brut dessine a 0x00000000, c'est-a-dire par-dessus l'image du
+ * module, ecran noir. Mesure avant correction : FBP 0 cote GE, framebuffer
+ * d'affichage 0x04000000, et 138 774 pixels ecrits au bas de la memoire. */
+static void test_ge_target(void) {
+    psp_ge_reset();
+    psp_display_reset();
+
+    const uint32_t LIST = 0x08830000u;
+    uint32_t w[8], n = 0;
+    w[n++] = (0x9Cu << 24) | 0x000000;      /* FBP -> VRAM + 0 */
+    w[n++] = (0x9Du << 24) | 512;           /* FBW -> stride 512 */
+    w[n++] = (0x0Fu << 24);                 /* FINISH */
+    w[n++] = (0x0Cu << 24);                 /* END */
+    for (uint32_t i = 0; i < n; i++) psp_write32(LIST + i * 4, w[i]);
+
+    uint32_t qid = call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
+    CHECK(qid != 0, "list with a framebuffer enqueued, got 0x%08X", qid);
+    CHECK(psp_render_target() == PSP_VRAM_BASE,
+          "FBP 0 means the start of VRAM, which the guest maps at 0x%08X, got 0x%08X",
+          PSP_VRAM_BASE, psp_render_target());
+
+    /* Et la deuxieme face du meme bug : un offset non nul doit rester DANS le
+     * VRAM (la double mise en tampon passe par la). Neuf listes a la suite, sans
+     * reinitalisation : la mesure qui a mis le doigt sur le plafond de la file
+     * etait que le jeu s'arretait a huit listes -- la taille de la table. */
+    static const uint32_t OFFSETS[9] = { 0x00000000u, 0x00088000u, 0x00044000u,
+                                         0x00000000u, 0x00088000u, 0x00044000u,
+                                         0x00000000u, 0x00088000u, 0x00044000u };
+    static const uint32_t OFFSET_LIST = 0x08830100u;
+    for (uint32_t pass = 0; pass < 9; pass++) {
+        if (pass) psp_write32(OFFSET_LIST + 0, (0x9Cu << 24) | OFFSETS[pass]);
+        else      psp_write32(LIST + 0,        (0x9Cu << 24) | OFFSETS[pass]);
+        uint32_t l = pass ? OFFSET_LIST : LIST;
+        uint32_t q = call(psp_nid("sceGeListEnQueue"), l, 0, 0, 0);
+        CHECK(q != 0, "list %u of nine in one run is enqueued, got 0x%08X", pass + 1, q);
+        CHECK(psp_render_target() == PSP_VRAM_BASE + OFFSETS[pass],
+              "FBP 0x%X draws at 0x%08X (VRAM + offset), got 0x%08X",
+              OFFSETS[pass], PSP_VRAM_BASE + OFFSETS[pass], psp_render_target());
+    }
+    CHECK(psp_render_target() >= PSP_VRAM_BASE, "and never outside VRAM");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -1245,6 +1293,7 @@ int main(void) {
     test_vpl();
     test_guest_strings();
     test_ge_display_list();
+    test_ge_target();
     test_ge_infinite_list();
     test_sas_adpcm();
     test_display();
