@@ -173,6 +173,10 @@ void     psp_umd_init(void);
 void     psp_umd_register(void);
 void     psp_umd_reset(void);
 uint32_t psp_umd_drive_stat(void);      /* what a guest would read right now */
+/* How many state changes were handed to the registered callback. */
+uint64_t psp_umd_notifications(void);
+/* How many times the guest registered one (0 means it never did). */
+uint64_t psp_umd_registrations(void);
 uint64_t psp_umd_unsatisfied_waits(void);
 
 /* sceRtc: microseconds since 0001-01-01, advancing with the run. */
@@ -237,15 +241,24 @@ void     psp_threadman_dump(FILE *out);
  * section of src/hle/threadman.c. */
 
 /* Whether an id names a callback the guest has actually created. A subsystem
- * that records a callback id (scePower's slots) has to ask first. */
+ * that records a callback id (scePower's slots, sceUmdUser's drive callback)
+ * has to ask first. */
 int psp_callback_valid(uint32_t uid);
 
+/* Raise a callback: (cbid, arg2). Queues it on the callback's own thread --
+ * delivery happens where that thread waits or checks, never here. Returns 0 if
+ * the id names no callback. A subsystem that owns a callback raises it through
+ * this (see src/hle/umd.c), so that the one implementation of "what a
+ * notification does" is the one in threadman.c. */
+int psp_threadman_notify_callback(uint32_t cbid, uint32_t arg);
+
 /* What delivery did, for a host's report: callbacks that ran, notifications
- * dropped because the target is not a recompiled function, and passes that hit
- * the per-tick ceiling. */
+ * dropped because the target is not a recompiled function, passes that hit the
+ * per-tick ceiling, and notifications lost when their callback was deleted. */
 uint64_t psp_threadman_callback_deliveries(void);
 uint64_t psp_threadman_callback_unresolved(void);
 uint64_t psp_threadman_callback_deferred(void);
+uint64_t psp_threadman_callback_dropped(void);
 
 /* scePower: the power callback slots. No power event exists in this HLE, so a
  * registered callback is never fired; what is real is the slot handed back to

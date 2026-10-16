@@ -224,6 +224,8 @@ static uint64_t     g_cb_deliveries;        /* callbacks that actually ran */
 static uint64_t     g_cb_unresolved;        /* notifications dropped: not a recompiled function */
 static uint64_t     g_cb_unresolved_logged;
 static uint64_t     g_cb_deliver_deferred;  /* passes that hit the per-tick ceiling */
+static uint64_t     g_cb_dropped;           /* notifications lost when their callback was deleted */
+static uint64_t     g_cb_dropped_logged;
 static int          g_cb_delivering;        /* re-entrance guard, see deliver_callbacks */
 static psp_vpl       g_vpl[MAX_VPLS];
 static psp_vpl_block g_vplblk[MAX_VPL_BLOCKS];
@@ -504,6 +506,8 @@ void psp_threadman_reset(void) {
     g_cb_unresolved = 0;
     g_cb_unresolved_logged = 0;
     g_cb_deliver_deferred = 0;
+    g_cb_dropped = 0;
+    g_cb_dropped_logged = 0;
     g_cb_delivering = 0;
     memset(g_vpl, 0, sizeof g_vpl);
     memset(g_vplblk, 0, sizeof g_vplblk);
@@ -733,6 +737,28 @@ static void *guest_thread_main(void *arg) {
      * says whether it finished or simply fell out somewhere. */
     fprintf(stderr, "thread %u ended   : status 0x%08X, last fn 0x%08X\n",
             t->uid, t->exit_status, psp_trace_last());
+
+    /* A thread that ends takes its callbacks with it, and any notification they
+     * were still holding. That is what "the callback belongs to its thread"
+     * means at the end of the thread -- and it is the quietest way for a
+     * notification to be lost, because nothing else changes: the guest notified,
+     * nothing ran, and no other counter moved. Same rule as a deleted callback,
+     * same counter. */
+    for (int i = 0; i < MAX_CBS; i++) {
+        if (!g_cb[i].used || g_cb[i].owner != t->uid) continue;
+        if (g_cb[i].notify_count) {
+            g_cb_dropped += (uint64_t)g_cb[i].notify_count;
+            if (!g_cb_dropped_logged) {
+                g_cb_dropped_logged = 1;
+                fprintf(stderr,
+                        "psprecomp: thread %u ended with %d notification(s) still queued on"
+                        " its callback '%s' -- they will never be delivered\n",
+                        t->uid, g_cb[i].notify_count, g_cb[i].name);
+            }
+        }
+        g_cb[i].used = 0;
+        g_cb[i].notify_count = 0;
+    }
 
     if (t->delete_after && t->stack_base) {
         psp_sysmem_release(t->stack_base);
@@ -1337,10 +1363,24 @@ static psp_callback *find_callback(uint32_t id) {
 }
 
 /* Whether an id names a callback the guest has actually created. A subsystem
- * that takes a callback id (scePower's slots, and sceUmdUser's drive callback)
- * has to ask: recording an id that names nothing is how a registration becomes
- * a lie, and the lie surfaces much later, as a callback that never runs. */
+ * that takes a callback id (scePower's slots, sceUmdUser's drive callback) has
+ * to ask: recording an id that names nothing is how a registration becomes a
+ * lie, and the lie surfaces much later, as a callback that never runs. */
 int psp_callback_valid(uint32_t uid) { return find_callback(uid) != NULL; }
+
+/* Raise a callback: (cbid, arg2). Queues work on the callback's own thread --
+ * it does not run here, because "here" is often another thread entirely, or an
+ * HLE call reacting to something the guest did. Returns 0 if the id names no
+ * callback, so a caller can refuse instead of queueing work that would never be
+ * delivered. Exported because a subsystem that owns a callback has to be able
+ * to raise it: sceUmdUser's drive callback is the case that measured this. */
+int psp_threadman_notify_callback(uint32_t cbid, uint32_t arg) {
+    psp_callback *c = find_callback(cbid);
+    if (!c) return 0;
+    c->notify_arg = arg;
+    if (c->notify_count < 0x7FFFFFFF) c->notify_count++;
+    return 1;
+}
 
 /* One delivery pass over the calling thread's pending callbacks. Returns how
  * many ran, which is what sceKernelCheckCallback reports as 1 or 0 -- the two
@@ -1434,17 +1474,33 @@ static void hle_CreateCallback(void) {
 static void hle_DeleteCallback(void) {
     psp_callback *c = find_callback(psp_arg(0));
     if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    /* A callback deleted with work still queued takes that work with it. On
+     * hardware that is what deleting means, so it is not an error -- but it is
+     * a notification the guest asked for and will never see, which is
+     * indistinguishable from a notification that never happened unless it is
+     * counted. Measured, not imagined: LocoRoco registers its drive callback two
+     * or three times over a boot, deleting the one before, so this is the
+     * ordinary path here and not a corner. */
+    if (c->notify_count) {
+        g_cb_dropped += (uint64_t)c->notify_count;
+        if (!g_cb_dropped_logged) {
+            g_cb_dropped_logged = 1;
+            fprintf(stderr,
+                    "psprecomp: callback '%s' (uid %u) was deleted with %d notification(s)"
+                    " still queued -- they will never be delivered\n",
+                    c->name, c->uid, c->notify_count);
+        }
+    }
     c->used = 0;
+    c->notify_count = 0;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_NotifyCallback(void) {
-    /* (cbid, arg2). Queues work on the callback's own thread; it does not run
-     * here, because "here" may be another thread entirely. */
-    psp_callback *c = find_callback(psp_arg(0));
-    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    c->notify_arg = psp_arg(1);
-    if (c->notify_count < 0x7FFFFFFF) c->notify_count++;
+    if (!psp_threadman_notify_callback(psp_arg(0), psp_arg(1))) {
+        psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);
+        return;
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1457,6 +1513,7 @@ static void hle_CheckCallback(void) {
 uint64_t psp_threadman_callback_deliveries(void) { return g_cb_deliveries; }
 uint64_t psp_threadman_callback_unresolved(void) { return g_cb_unresolved; }
 uint64_t psp_threadman_callback_deferred(void) { return g_cb_deliver_deferred; }
+uint64_t psp_threadman_callback_dropped(void)  { return g_cb_dropped; }
 
 uint64_t psp_threadman_created(void) { return g_created; }
 uint64_t psp_threadman_started(void) { return g_started; }

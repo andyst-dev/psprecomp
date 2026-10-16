@@ -60,12 +60,16 @@
 static uint32_t g_stat;
 static uint32_t g_cbid;         /* the one registered drive callback, 0 for none */
 static uint64_t g_unsatisfied;  /* waits this model could not satisfy */
+static uint64_t g_notified;     /* state changes the registered callback was told about */
+static uint64_t g_registrations;/* drive callbacks the guest registered (they can be replaced) */
 static uint32_t g_reported;     /* which of those states have been named already */
 
 void psp_umd_reset(void) {
     g_stat = UMD_STAT_INSERTED;
     g_cbid = 0;
     g_unsatisfied = 0;
+    g_notified = 0;
+    g_registrations = 0;
     g_reported = 0;
 }
 
@@ -83,6 +87,36 @@ uint64_t psp_umd_unsatisfied_waits(void) { return g_unsatisfied; }
  * drive stat of 0 reads as "no disc", which is a plausible answer a game acts
  * on rather than an error it can notice. */
 uint32_t psp_umd_drive_stat(void) { return g_stat; }
+
+/* How many state changes were handed to the registered callback. Like the two
+ * above: a notification that was never raised and a notification that was
+ * raised and never delivered look identical from outside, and this is the half
+ * this file owns. */
+uint64_t psp_umd_notifications(void) { return g_notified; }
+
+/* How many times the guest registered one, so that "registered but never told"
+ * is distinguishable from "never registered" in a report. Both look the same
+ * from outside otherwise, and they mean opposite things: a title waiting on a
+ * drive callback it did register is waiting on a state change, while one that
+ * never registered has no reason to. */
+uint64_t psp_umd_registrations(void) { return g_registrations; }
+
+/* A drive state change is a notification to the game's callback, which is what
+ * the callback is registered for. The argument is the state itself: that is what
+ * the callback's own mask is built to read, and this title's callback tests
+ * `arg & 0x3B` -- a copy of the state bits -- before anything else.
+ *
+ * The firmware's exact notification value is not sourced here (the reference
+ * implementation could not be consulted while this was written), and the choice
+ * matters less than it looks: any value carrying a state bit makes this game's
+ * callback proceed, and the state it then reads is the same one GetDriveStat
+ * would answer. What is stated rather than assumed is that the notification
+ * happens on a *change* -- activation and deactivation, the two places this
+ * model can change the state. */
+static void notify_drive_state(void) {
+    if (!g_cbid) return;
+    if (psp_threadman_notify_callback(g_cbid, g_stat)) g_notified++;
+}
 
 /* ---- the calls ----------------------------------------------------------- */
 
@@ -103,6 +137,7 @@ static void hle_UmdActivate(void) {
     if (strcmp(drive, "disc0:") != 0) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
 
     g_stat = UMD_STAT_ACTIVATED;
+    notify_drive_state();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -115,6 +150,7 @@ static void hle_UmdDeactivate(void) {
     int32_t unit = (int32_t)psp_arg(0);
     if (unit < 1 || unit > 18) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
     g_stat = UMD_STAT_INSERTED;
+    notify_drive_state();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -169,13 +205,13 @@ static void hle_UmdRegisterUMDCallBack(void) {
      * check is against the toolkit's own callback table, so it is exactly as
      * wide as the callbacks the guest has actually created.
      *
-     * Delivery is a separate matter: callbacks are not fired anywhere in this
-     * toolkit yet (see the note in threadman.c), so recording the id is the
-     * whole of what can be done. Said here because it matters on this path: a
-     * title that waits for its drive callback to arm something is waiting for
-     * that piece of the runtime, not for a bug in this file. */
+     * Registering is not the end of it: a state change notifies this callback
+     * (see notify_drive_state). A title that arms something from its drive
+     * callback and waits on that flag is waiting for a state change now, which
+     * is a real thing this model can produce, not for a missing runtime. */
     if (!psp_callback_valid(cbid)) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT); return; }
     g_cbid = cbid;
+    g_registrations++;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

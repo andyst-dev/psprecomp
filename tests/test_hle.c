@@ -724,6 +724,17 @@ static void fake_other_thread(void) {
     g_other_delta = (uint32_t)g_cb_calls - before;
 }
 
+/* The callback body every test callback points at. */
+#define TEST_CB_FN 0x08803000u
+
+/* And one that creates its own callback, notifies it, and ends with the
+ * notification still queued -- the quietest way for work to disappear. */
+static uint32_t g_thread_cbid;
+static void fake_thread_own_callback(void) {
+    g_thread_cbid = call(psp_nid("sceKernelCreateCallback"), 0, TEST_CB_FN, 0xEE, 0);
+    call(psp_nid("sceKernelNotifyCallback"), g_thread_cbid, 0x66, 0, 0);
+}
+
 static void test_callbacks(void) {
     psp_threadman_reset();
     psp_power_reset();
@@ -810,6 +821,36 @@ static void test_callbacks(void) {
     CHECK(call(NOTIFY, cbid, 0, 0, 0) != 0, "a deleted callback cannot be notified");
     CHECK(call(DELETE, cbid, 0, 0, 0) != 0, "and deleting it twice fails");
 
+    /* A callback deleted with work still queued takes it with it -- and that is
+     * counted, not silently lost: a notification the guest asked for and will
+     * never see is indistinguishable from one that never happened. LocoRoco
+     * registers its drive callback two or three times over a boot, deleting the
+     * one before, so this is the ordinary path. */
+    uint64_t dropped = psp_threadman_callback_dropped();
+    uint32_t cbid4 = call(CREATE, 0, FN, 0, 0);
+    call(NOTIFY, cbid4, 0x44, 0, 0);
+    CHECK(call(DELETE, cbid4, 0, 0, 0) == 0, "deleting a callback with work queued succeeds");
+    CHECK(psp_threadman_callback_dropped() == dropped + 1,
+          "and the queued notification is counted, got %llu",
+          (unsigned long long)psp_threadman_callback_dropped());
+    CHECK(call(CHECK, 0, 0, 0, 0) == 0, "and it is not delivered afterwards");
+
+    /* And a thread that ends takes its callbacks with it, notifications and all:
+     * the quietest way for work to be lost, since nothing else in a run
+     * changes. */
+    uint64_t dropped2 = psp_threadman_callback_dropped();
+    const uint32_t OWN = 0x08803200u;
+    psp_register(OWN, fake_thread_own_callback);
+    uint32_t own_tid = call5(CREATE_TH, 0, OWN, 32, 0x4000, 0);
+    CHECK(call(START, own_tid, 0, 0, 0) == 0, "thread that owns a callback started");
+    CHECK(call(END, own_tid, 0x08804100u, 0, 0) == 0, "and ended");
+    CHECK(g_thread_cbid != 0, "it created its own callback");
+    CHECK(psp_threadman_callback_dropped() == dropped2 + 1,
+          "and its queued notification went with it, got %llu",
+          (unsigned long long)psp_threadman_callback_dropped());
+    CHECK(call(NOTIFY, g_thread_cbid, 0, 0, 0) != 0,
+          "the dead thread's callback cannot be notified either");
+
     /* Power callback slots. No power event exists in this HLE, so what is real
      * is the slot: the caller passes -1, stores what comes back, and passes it
      * to unregister later. */
@@ -830,6 +871,15 @@ static void test_callbacks(void) {
 
 /* ---- sceUmdUser ---------------------------------------------------------- */
 
+/* The callback a title registers for its drive. It records what a state change
+ * told it, which is the whole of what such a callback is for. */
+static int      g_umd_cb_calls;
+static uint32_t g_umd_cb_event;
+static void fake_umd_callback(void) {
+    g_umd_cb_calls++;
+    g_umd_cb_event = psp_cpu.r[PSP_REG_A1];
+}
+
 static void test_umd(void) {
     psp_umd_reset();
     psp_threadman_reset();
@@ -842,10 +892,13 @@ static void test_umd(void) {
     const uint32_t REGISTER   = psp_nid("sceUmdRegisterUMDCallBack");
     const uint32_t UNREGISTER = psp_nid("sceUmdUnRegisterUMDCallBack");
     const uint32_t MKCALLBACK = psp_nid("sceKernelCreateCallback");
+    const uint32_t CHECKCB    = psp_nid("sceKernelCheckCallback");
 
     const uint32_t DRIVE = 0x0880F000u;    /* guest memory, inside RAM */
     const uint32_t OTHER = 0x0880F020u;
     const uint32_t CBNAME = 0x0880F040u;
+    const uint32_t CBFN   = 0x08801000u;    /* a recompiled function, so it can run */
+    psp_register(CBFN, fake_umd_callback);
     const char *disc0 = "disc0:", *other = "ms0:", *cbname = "umd";
     for (uint32_t i = 0; i <= strlen(disc0); i++) psp_write8(DRIVE + i, (uint8_t)disc0[i]);
     for (uint32_t i = 0; i <= strlen(other); i++) psp_write8(OTHER + i, (uint8_t)other[i]);
@@ -898,12 +951,43 @@ static void test_umd(void) {
     CHECK(call(REGISTER, 0xDEADBEEF, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
           "registering an id that is not a callback is refused");
 
-    uint32_t cb = call(MKCALLBACK, CBNAME, 0x08801000u, 0, 0);
+    uint32_t cb = call(MKCALLBACK, CBNAME, CBFN, 0, 0);
     CHECK(cb != 0, "a callback is created, got 0x%08X", cb);
     CHECK(call(REGISTER, cb, 0, 0, 0) == 0, "and registered");
+
+    /* A state change is a notification, and this is the path a title actually
+     * lives on: it registers a drive callback, arms something from it, and
+     * waits on that flag. The notification queues on the callback's own thread
+     * -- this one -- so it runs at the next check point, carrying the state the
+     * drive moved to. */
+    uint64_t notified = psp_umd_notifications();
+    g_umd_cb_calls = 0;
+    CHECK(call(DEACTIVATE, 1, 0, 0, 0) == 0, "deactivation succeeds");
+    CHECK(psp_umd_notifications() == notified + 1, "and notifies the drive callback");
+    CHECK(g_umd_cb_calls == 0, "which is queued, not run in place");
+    CHECK(call(CHECKCB, 0, 0, 0, 0) == 1, "the next check point runs it");
+    CHECK(g_umd_cb_calls == 1, "once, got %d", g_umd_cb_calls);
+    CHECK(g_umd_cb_event == 0x12, "carrying the state the drive moved to, got 0x%02X",
+          g_umd_cb_event);
+    g_umd_cb_calls = 0;
+    CHECK(call(ACTIVATE, 1, DRIVE, 0, 0) == 0, "activation again");
+    CHECK(call(CHECKCB, 0, 0, 0, 0) == 1 && g_umd_cb_calls == 1, "notifies again");
+    CHECK(g_umd_cb_event == 0x32, "with the activated state, got 0x%02X", g_umd_cb_event);
+
+    /* An un-registered callback is not notified: the drive goes on changing
+     * state, and nothing is told about it. */
+    CHECK(call(UNREGISTER, cb, 0, 0, 0) == 0, "un-registering the registered one succeeds");
+    uint64_t quiet = psp_umd_notifications();
+    g_umd_cb_calls = 0;
+    CHECK(call(DEACTIVATE, 1, 0, 0, 0) == 0, "and the drive still deactivates");
+    CHECK(psp_umd_notifications() == quiet, "with nothing notified");
+    CHECK(call(ACTIVATE, 1, DRIVE, 0, 0) == 0, "nor on activation");
+    CHECK(psp_umd_notifications() == quiet, "still nothing notified");
+    call(CHECKCB, 0, 0, 0, 0);
+    CHECK(g_umd_cb_calls == 0, "and the callback never ran");
+
     CHECK(call(UNREGISTER, cb + 1, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
           "un-registering a different id is refused");
-    CHECK(call(UNREGISTER, cb, 0, 0, 0) == 0, "un-registering the registered one succeeds");
     CHECK(call(UNREGISTER, cb, 0, 0, 0) == SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT,
           "and there is only ever one registered");
 
