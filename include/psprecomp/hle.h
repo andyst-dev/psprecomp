@@ -157,6 +157,15 @@ void psp_ge_dump_stats(FILE *out);
  *  ne s'appliquent pas a sa geometrie, et ses sommets colores portent
  *  0x00000000. */
 uint64_t psp_ge_state_command_count(unsigned cmd, uint32_t *first, uint32_t *last);
+
+/** L'etat de texture tel que l'invite le programme : adresse (construite depuis
+ *  TEXADDR0 et les 16 bits hauts de TEXBUFWIDTH0, puis masquee a 21 bits : c'est
+ *  un offset dans l'eDRAM de 2 Mo), largeur de ligne en mots, taille brute, format,
+ *  et le nombre de primitives dessinees avec des coordonnees de texture. Aucun
+ *  echantillonnage n'est fait -- c'est ce qui rend une capture lisible, et ce qui
+ *  nomme le travail restant. */
+void psp_ge_texture_state(uint32_t *addr, uint32_t *bufw, uint32_t *size,
+                          uint32_t *format, uint64_t *draws);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);

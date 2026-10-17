@@ -52,6 +52,18 @@
 #define GE_ORIGIN_ADDR  0x14
 #define GE_FBP          0x9C
 #define GE_FBW          0x9D
+#define GE_ZBP          0x9E
+#define GE_ZBW          0x9F
+#define GE_TEXADDR0     0xA0
+#define GE_TEXBUFWIDTH0 0xA8
+#define GE_CLUTADDR     0xB0
+#define GE_CLUTADDRUPPER 0xB1
+#define GE_TEXSIZE0     0xB8
+#define GE_TEXFORMAT    0xC3
+#define GE_CLUTFORMAT   0xC5
+#define GE_TEXFILTER    0xC6
+#define GE_TEXWRAP      0xC7
+#define GE_TEXFUNC      0xC9
 
 #define MAX_QUEUES 8
 #define GE_STACK   8
@@ -100,6 +112,22 @@ static uint64_t g_col_count[COL_HIST];
 static uint64_t g_col_total;
 static unsigned g_col_n;
 
+/* Etat de texture, tel que l'invite le programme.
+ *
+ * Il restait dans le seau « commandes non decodees », et c'est exactement ce que
+ * le bring-up ne peut pas se permettre : sans lui, une capture ne dit pas quelle
+ * texture a ete dessinee. Les numeros de commande viennent de l'enumeration des
+ * registres de la GE (`ge_constants.h`), et les valeurs mesurees sur ce titre
+ * sont : TEXADDR0 0xE93DB0 (masque a 21 bits = 0x93DB0, ce que le vidage du VRAM a
+ * confirme : les octets de la texture sont la), TEXBUFWIDTH0 0x0900A0, CLUTADDR
+ * 0xE93D70, TEXSIZE0 0x000508, TEXFORMAT 4, CLUTFORMAT 0x00FF03, TEXFILTER
+ * 0x101, TEXWRAP 0, TEXFUNC 0. Le format 4 se lit aussi dans les donnees : le
+ * CLUT du VRAM est en 16 bits et les indices sont des octets. */
+static struct {
+    uint32_t addr, bufw, size, format, filter, wrap, func, clut_addr, clut_fmt;
+    uint64_t draws_with_texcoords;
+} g_tex;
+
 /* Vertices drawn per vertex format. Read against pspsdk's GU_* shifts
  * (GU_VERTEX_SHIFT(n) = n << 7, GU_COLOR_SHIFT(n) = n << 2, GU_TRANSFORM_2D =
  * 1 << 23), so a format this toolkit cannot read yet is a count rather than a
@@ -123,6 +151,7 @@ static struct {
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(&g_ge, 0, sizeof g_ge);
+    memset(&g_tex, 0, sizeof g_tex);
     memset(g_cmd_count, 0, sizeof g_cmd_count);
     memset(g_cmd_first, 0, sizeof g_cmd_first);
     memset(g_cmd_last, 0, sizeof g_cmd_last);
@@ -159,6 +188,23 @@ uint64_t psp_ge_state_command_count(unsigned cmd, uint32_t *first, uint32_t *las
     if (first) *first = g_cmd_first[cmd];
     if (last)  *last  = g_cmd_last[cmd];
     return g_cmd_count[cmd];
+}
+
+/* Champs de TEXSIZE0 : un exposant par dimension, largeur dans les 4 bits bas et
+ * hauteur au-dessus (convention des registres de la GE : la taille se programme
+ * en log2). TEXBUFWIDTH0 melange lui aussi deux choses : les 16 bits bas sont la
+ * largeur de ligne en mots, les 16 bits hauts la partie haute de l'adresse de la
+ * texture -- d'ou un texel qui ne se calcule pas a partir de TEXADDR0 seul. */
+static unsigned tex_w(uint32_t size) { return 1u << (size & 0xF); }
+static unsigned tex_h(uint32_t size) { return 1u << ((size >> 8) & 0xF); }
+
+void psp_ge_texture_state(uint32_t *addr, uint32_t *bufw, uint32_t *size,
+                          uint32_t *format, uint64_t *draws) {
+    if (addr)   *addr   = g_tex.addr | (g_tex.bufw & 0xFFFF0000u);
+    if (bufw)   *bufw   = g_tex.bufw & 0xFFFFu;
+    if (size)   *size   = g_tex.size;
+    if (format) *format = g_tex.format;
+    if (draws)  *draws  = g_tex.draws_with_texcoords;
 }
 
 void psp_ge_dump_stats(FILE *out) {
@@ -200,6 +246,18 @@ void psp_ge_dump_stats(FILE *out) {
         for (unsigned i = 0; i < g_col_n; i++)
             fprintf(out, "        0x%08X %10llu\n", g_col_val[i],
                     (unsigned long long)g_col_count[i]);
+    }
+    if (g_tex.addr || g_tex.size || g_tex.format) {
+        fprintf(out, "    texture state (derniere vue) : TEXADDR0 0x%06X, TEXBUFWIDTH0 0x%06X "
+                     "(lignes de %u mots), TEXSIZE0 0x%06X -> %ux%u, TEXFORMAT %u\n",
+                g_tex.addr | (g_tex.bufw & 0xFFFF0000u), g_tex.bufw, g_tex.bufw & 0xFFFFu,
+                g_tex.size, tex_w(g_tex.size), tex_h(g_tex.size), g_tex.format);
+        fprintf(out, "        CLUTADDR 0x%06X, CLUTFORMAT 0x%06X, TEXFILTER 0x%X, "
+                     "TEXWRAP 0x%X, TEXFUNC %u\n",
+                g_tex.clut_addr, g_tex.clut_fmt, g_tex.filter, g_tex.wrap, g_tex.func);
+        fprintf(out, "        primitives avec coordonnees de texture : %llu (aucun "
+                     "echantillonnage : elles remplissent en blanc)\n",
+                (unsigned long long)g_tex.draws_with_texcoords);
     }
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
     if (g_unsupported)
@@ -319,6 +377,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
         if (g_vt_val[i] == g_ge.vtype) { g_vt_verts[i] += count; goto noted; }
     if (g_vt_n < VT_HIST) { g_vt_val[g_vt_n] = g_ge.vtype; g_vt_verts[g_vt_n] = count; g_vt_n++; }
 noted:
+    if (VT_TEX(g_ge.vtype)) g_tex.draws_with_texcoords++;
     if (!VT_THROUGH(g_ge.vtype)) { g_unsupported += count; return; }
     if (!g_ge.vaddr) { g_unsupported += count; return; }
 
@@ -452,6 +511,22 @@ static void run_list(ge_queue *q) {
 
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
         case GE_IADDR: break;
+
+        /* Les commandes de texture, nommees par l'enumeration des registres de la
+         * GE. Elles ne servent encore a rien -- aucun echantillonnage -- mais les
+         * suivre est ce qui rend une capture lisible : « la derniere texture
+         * etait 256x32 CLUT8 a 0x93DB0 » se verifie dans les octets du VRAM, une
+         * image blanche toute seule ne dit rien. */
+        case GE_TEXADDR0:      g_tex.addr = arg & 0xFFFFFF; break;
+        case GE_TEXBUFWIDTH0:  g_tex.bufw = arg; break;
+        case GE_CLUTADDR:      g_tex.clut_addr = arg & 0xFFFFFF; break;
+        case GE_CLUTADDRUPPER: g_tex.clut_addr |= (arg & 0xFF0000u) << 8; break;
+        case GE_TEXSIZE0:      g_tex.size = arg; break;
+        case GE_TEXFORMAT:     g_tex.format = arg; break;
+        case GE_CLUTFORMAT:    g_tex.clut_fmt = arg; break;
+        case GE_TEXFILTER:     g_tex.filter = arg; break;
+        case GE_TEXWRAP:       g_tex.wrap = arg; break;
+        case GE_TEXFUNC:       g_tex.func = arg; break;
 
         default:
             /* Un vrai changement d'etat que l'interpreteur ne decode pas

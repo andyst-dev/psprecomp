@@ -1288,6 +1288,27 @@ static void test_ge_target(void) {
     CHECK(n53 == 1, "the state command 0x53 is counted once, got %llu",
           (unsigned long long)n53);
     CHECK(first == 7 && last == 7, "with its argument recorded, got 0x%X/0x%X", first, last);
+
+    /* L'etat de texture, avec les valeurs mesurees sur ce titre : TEXADDR0
+     * 0xE93DB0 complete par les 16 bits hauts de TEXBUFWIDTH0 (0x0900), donc une
+     * adresse de 0x09E93DB0 dont l'offset dans l'eDRAM de 2 Mo est 0x93DB0 --
+     * c'est bien la que le vidage du VRAM a trouve des octets. TEXSIZE0 0x508 se
+     * lit 256x32 (un exposant par dimension), TEXFORMAT 4 = CLUT8. */
+    psp_ge_reset();
+    const uint32_t texwords[6] = { (0xA0u << 24) | 0xE93DB0u, (0xA8u << 24) | 0x0900A0u,
+                                   (0xB8u << 24) | 0x000508u, (0xC3u << 24) | 4u,
+                                   (0x0Fu << 24), (0x0Cu << 24) };
+    for (int i = 0; i < 6; i++) psp_write32(LIST + (uint32_t)i * 4, texwords[i]);
+    CHECK(call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0) != 0,
+          "a list with texture state is enqueued");
+    uint32_t ta = 0, tb = 0, ts = 0, tf = 0;
+    uint64_t td = 0;
+    psp_ge_texture_state(&ta, &tb, &ts, &tf, &td);
+    CHECK((ta & 0x001FFFFFu) == 0x00093DB0u,
+          "the texture address is TEXADDR0 completed by TEXBUFWIDTH0, inside the 2 MB "
+          "eDRAM: got 0x%08X", ta);
+    CHECK(tb == 0x00A0u, "TEXBUFWIDTH0 keeps its line width in words, got 0x%X", tb);
+    CHECK(ts == 0x000508u && tf == 4u, "TEXSIZE0/TEXFORMAT are kept raw, got 0x%X/%u", ts, tf);
 }
 
 int main(void) {
