@@ -172,11 +172,11 @@ It does not yet render. Being specific about which parts are real:
 | **Function discovery** | ✅ Working | Fixpoint walk over exports, relocations, jump tables and `lui`+`addiu` code pointers — 6,935 functions in the flagship module, 92% of `.text` |
 | **C emitter** | ✅ Working | Every discovered function, every label individually dispatchable (13,682 entries) — computed jumps resolve by construction |
 | **Runtime** | ✅ Working | Register file, memory map with cache mirrors, dispatch, static constructors |
-| **VFPU** | 🔨 Partial | Arithmetic, matrix ops, constants, immediates, prefixes. 108 of 137,748 instructions still trap (0.08%) |
+| **VFPU** | 🔨 Partial | Arithmetic, matrix ops, constants, immediates, prefixes applied, register moves, integer packing, rotations and cross products. In WTF only words that are data, not code, still trap |
 | **HLE firmware** | 🔨 Partial | 112 registrations across sysmem, threadman, GE, display, sascore, io, ctrl. Every NID verified against SHA-1 of its own name |
-| **GE rasterizer** | 🔨 Partial | Triangles, strips, fans, sprites; through mode and transformed (world/view/projection, viewport). Textures in every non-DXT format, swizzled or not, with CLUTs; texture function, alpha test, blending, clear mode, scissor. Tests assert *where* pixels land and what colour they are. No depth, lighting or DXT yet |
+| **GE rasterizer** | 🔨 Partial | Triangles, strips, fans, sprites; through mode and transformed (world/view/projection, viewport). Textures in every format including DXT, swizzled or not, with CLUTs; texture function, alpha test, depth test, blending, clear mode, scissor; per-vertex lighting; indexed drawing. Tests assert *where* pixels land and what colour they are. No near-plane clipping, fog or culling yet |
 | **Threading** | 🔨 Experimental opt-in | Inline execution by default; `PSPRECOMP_REAL_THREADS=ON` enables cooperative host threads, one CPU handed over at waits. See [threading modes](docs/THREADING.md) |
-| **A game on screen** | 🔨 In game | With `PSPRECOMP_REAL_THREADS=ON` the flagship goes from its title screen through its menu into a game of Lumberjack, drawn correctly by the software renderer, with sound mixed (not yet played to a device). Menu text is missing. With default inline execution it stops at a semaphore wait. See [BRINGUP.md](docs/BRINGUP.md) |
+| **A game on screen** | 🔨 In game | With `PSPRECOMP_REAL_THREADS=ON` the flagship goes from its title screen through its menu into games of Lumberjack and Pendemonium (lit 3D, DXT textures, depth), drawn by the software renderer, with sound mixed (not yet played to a device). With default inline execution it stops at a semaphore wait. See [BRINGUP.md](docs/BRINGUP.md) |
 
 ### Bring-up instruments
 

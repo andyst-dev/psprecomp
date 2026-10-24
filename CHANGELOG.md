@@ -8,9 +8,16 @@ the time, and none were added afterwards.
 ### Unreleased
 
 *WTF goes from its title screen, through the Job Share menu, into a game of
-Lumberjack and its paycheck screen.*
+Lumberjack and its paycheck screen. A second microgame, Pendemonium, plays
+too: a lit 3D factory scene where you cap pens.*
 
 **Emitter**
+- **A jump that leaves runs its delay slot even when another body owns it.**
+  `j` and `jr` now emit a copy of a foreign slot before they go, as branches
+  already did. Pendemonium builds the struct offset 0x44AF0 with
+  `lui`/`ori`, which discovery took for a code address; it landed on the slot
+  of a `jr $ra` whose `addiu $sp, $sp, 16` was then dropped, and every call
+  leaked 16 bytes of stack.
 - **A branch-and-link is a conditional call.** `bgezal`/`bltzal` and the
   likely forms call their target and carry on after the delay slot, and link
   `$ra` whether or not they are taken. The taken path used to be a tail
@@ -24,7 +31,44 @@ Lumberjack and its paycheck screen.*
   leaked an 896-byte frame per call into the heap. Every call's return site is
   now a label.
 
+**VFPU**
+- **Operand prefixes are applied, not trapped.** `vpfxs`/`vpfxt` swizzle,
+  negate, take absolute values and substitute constants on each source lane;
+  `vpfxd` saturates and masks the destination. WTF broadcasts a lane before a
+  clamp, builds box corners with them, and compares against |x|. The matrix
+  ops still trap on a pending prefix.
+- **`mfv`/`mtv` and `mfvc`/`mtvc`**, the integer packing ops (`vi2uc`, `vi2c`,
+  `vi2us`, `vi2s`, `vuc2i`, `vc2i`, `vus2i`, `vs2i`), `vocp`, `vsgn`, `vsge`,
+  `vslt`, `vscmp`, `vhdp`, `vcrs`, `vcrsp`/`vqmul`, `vdet`, `vrot`, the
+  `vcmp` conditions 8-15 and `vnop`/`vsync`/`vflush`. WTF's colour helper
+  ends `vi2uc; mfv`; unimplemented, it returned whatever `$v0` held, so every
+  menu glyph was drawn in the display-list pointer's "colour", alpha 9.
+- **`vidt` writes the identity column its register names** (`vidt.q C730` is
+  (0, 0, 0, 1)). It used bits 6-7 instead. WTF keeps s733 = 1 that way for its
+  quaternion-to-matrix code, so every animated node had a zero 3x3 and the
+  microgames' title cards were drawn at a point: an invisible screen that
+  looked like a 25-second load.
+
+**Renderer**
+- **Lighting**: four lights (directional, point, spot; ambient, diffuse,
+  specular, powered diffuse), material colours with CMAT, per vertex in world
+  space.
+- **Depth**: a 16-bit depth buffer in VRAM, ZTEST/ZMSK, ZSCALE/ZPOS, and depth
+  clears.
+- **DXT1/3/5 textures**, in the PSP's block layout (indices first).
+- **Indexed drawing**, and PRIM leaves VADDR/IADDR after what it used, so the
+  next PRIM continues from there. WTF draws runs of PRIMs with one VADDR;
+  they had all re-read the first vertices.
+- **Attributes are sampled at the pixel centre.** At the corner, a row of a
+  1:1 texture landed on the texel edge and float error floored it to the row
+  before; WTF's LED panels lost whole rows of dots.
+- Triangles with a vertex behind the eye are dropped one by one, not the
+  whole 256-vertex batch they arrived in.
+
 **Runtime and HLE**
+- **A new thread starts with its creator's `$gp`.** Under real threads it
+  started at 0, and Pendemonium, whose globals are `$gp`-relative, read its
+  own code as data.
 - **An unbounded wait does not time out while another thread could end it.**
   WTF's sound thread waits forever on a request queue and does not check the
   result; a fake timeout made it open a file named NULL. A waiter with no other
@@ -60,6 +104,10 @@ Lumberjack and its paycheck screen.*
   now draws all of them. Stall updates on a finished list succeed.
 
 **Instruments**
+- **`PSPRECOMP_TRACE_GE=<frame>`** logs every command, primitive and its first
+  vertices during one frame.
+- The write watch prints the guest calls in flight, not just the last
+  function entered.
 - **`psp_hle_dump_counts()`** prints call counts per firmware function,
   busiest first, with unimplemented NIDs counted individually.
 - **`psp_mem_watch_read()`** names each function that reads an address.
