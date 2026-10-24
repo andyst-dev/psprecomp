@@ -55,7 +55,7 @@ int psp_ctors_find(uint32_t lo, uint32_t hi, uint32_t code_lo, uint32_t code_hi,
         uint32_t p = a;
         for (;; p += 4) {
             uint32_t v = psp_read32(p);
-            if (v < code_lo || v >= code_hi || (v & 3)) break;
+            if (!v || v < code_lo || v >= code_hi || (v & 3)) break;   /* 0 ends a table */
             n++;
             if (n > 4096) break;                  /* not a constructor table */
         }

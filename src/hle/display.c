@@ -50,23 +50,35 @@ uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
  * no framebuffer has been set yet (which is itself worth knowing during
  * bring-up: the game never got as far as showing anything). */
 int psp_display_capture(const char *path) {
-    if (!g_fb_addr) return -1;
+    static uint32_t px[PSP_SCREEN_W * PSP_SCREEN_H];
+    if (psp_display_read(px) != 0) return -1;
 
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fprintf(f, "P6\n%d %d\n255\n", PSP_SCREEN_W, PSP_SCREEN_H);
-
-    const int bpp = (g_fb_format == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
-    for (int y = 0; y < PSP_SCREEN_H; y++) {
-        for (int x = 0; x < PSP_SCREEN_W; x++) {
-            uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_width + x) * (uint32_t)bpp;
-            uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
-            uint32_t c = psp_color_expand(px, (int)g_fb_format);
-            uint8_t rgb[3] = { (uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16) };
-            fwrite(rgb, 1, 3, f);        /* PPM is RGB; alpha is dropped */
-        }
+    for (int i = 0; i < PSP_SCREEN_W * PSP_SCREEN_H; i++) {
+        const uint32_t c = px[i];
+        uint8_t rgb[3] = { (uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16) };
+        fwrite(rgb, 1, 3, f);            /* PPM is RGB; alpha is dropped */
     }
     fclose(f);
+    return 0;
+}
+
+/* The front buffer, converted, for a window or a capture. Read while the game
+ * runs: a frame being drawn into the *back* buffer is never seen, which is the
+ * point of the game double-buffering. */
+int psp_display_read(uint32_t *out) {
+    const uint32_t addr = g_fb_addr, stride = g_fb_width, fmt = g_fb_format;
+    if (!addr) return -1;
+    const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
+    for (int y = 0; y < PSP_SCREEN_H; y++) {
+        for (int x = 0; x < PSP_SCREEN_W; x++) {
+            uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
+            uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
+            out[y * PSP_SCREEN_W + x] = psp_color_expand(px, (int)fmt);
+        }
+    }
     return 0;
 }
 
