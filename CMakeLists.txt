@@ -40,6 +40,8 @@ add_library(psprecomp STATIC
     src/render.c
     src/vfpu.c
     src/traps.c
+    src/window.c
+    src/module.c
     src/hle/hle.c
     src/hle/sysmem.c
     src/hle/threadman.c
@@ -66,6 +68,9 @@ option(PSPRECOMP_REAL_THREADS "Enable experimental cooperative host-thread sched
 target_compile_definitions(psprecomp PUBLIC
     PSPRECOMP_REAL_THREADS=$<BOOL:${PSPRECOMP_REAL_THREADS}>
 )
+if(WIN32)
+    target_link_libraries(psprecomp PUBLIC xinput9_1_0)   # the window's controller input
+endif()
 if(PSPRECOMP_REAL_THREADS AND WIN32)
     target_link_libraries(psprecomp PUBLIC winmm)   # timeBeginPeriod
 endif()

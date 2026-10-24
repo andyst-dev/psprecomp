@@ -55,3 +55,7 @@ add_test(NAME ctors COMMAND test_ctors)
 add_executable(test_raster test_raster.c)
 target_link_libraries(test_raster PRIVATE psprecomp)
 add_test(NAME raster COMMAND test_raster)
+
+add_executable(test_module test_module.c)
+target_link_libraries(test_module PRIVATE psprecomp)
+add_test(NAME module COMMAND test_module)

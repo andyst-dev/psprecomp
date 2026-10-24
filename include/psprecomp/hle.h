@@ -139,6 +139,9 @@ void psp_display_init(void);
 void psp_display_register(void);
 void psp_display_reset(void);
 int      psp_display_capture(const char *path);
+/* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
+ * set a framebuffer. */
+int      psp_display_read(uint32_t *out);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
 

@@ -31,6 +31,20 @@ too: a lit 3D factory scene where you cap pens.*
   leaked an 896-byte frame per call into the heap. Every call's return site is
   now a label.
 
+**Hosting a game**
+- **`psprecomp/window.h`: a window to play in.** Shows the front buffer
+  scaled with whole-pixel nearest sampling, letterboxed, and feeds the
+  keyboard and the first XInput controller to sceCtrl, on a host thread of
+  its own. Windows (Win32, GDI, XInput: no dependencies); elsewhere it
+  reports that it cannot open, until an SDL2 backend like ps3recomp's.
+- **`psprecomp/module.h`: load and start a module.** Places the image, reads
+  module_start from the ELF header and `$gp` from the module info, finds the
+  constructor table, and starts the module the way the loader would. What a
+  bring-up harness used to hard-code per game.
+- `psp_display_read()` gives the front buffer as pixels; the capture uses it.
+- Constructor discovery stops a run at a zero word: a module linked at 0 has
+  zeros that read as pointers to its first byte.
+
 **VFPU**
 - **Operand prefixes are applied, not trapped.** `vpfxs`/`vpfxt` swizzle,
   negate, take absolute values and substitute constants on each source lane;
