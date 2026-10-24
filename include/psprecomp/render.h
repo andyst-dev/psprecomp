@@ -20,8 +20,10 @@
  * here and below are 0xAABBGGRR, the GE's own byte order. */
 typedef struct {
     int      x, y;
+    float    z;              /* depth, 0..65535 */
     uint32_t rgba;
     float    u, v;
+    int      behind;         /* behind the eye: triangles using it are dropped */
 } psp_vertex;
 
 /* GE primitive types, from the PRIM argument's type field. */
@@ -50,6 +52,7 @@ typedef struct {
     int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
     int      clear_color;    /* CLEAR bit 8: ...to RGB */
     int      clear_alpha;    /* CLEAR bit 9: ...to alpha (stencil) */
+    int      clear_depth;    /* CLEAR bit 10: ...to depth */
     int      gouraud;        /* SHADE */
 
     int      tex_enable;     /* TME */
@@ -78,6 +81,12 @@ typedef struct {
     int      atest_func, atest_ref, atest_mask; /* ATST */
 
     int      sc_x0, sc_y0, sc_x1, sc_y1;        /* SCISSOR1/2, inclusive */
+
+    int      ztest;          /* ZTE */
+    int      zfunc;          /* ZTST: 0 never .. 7 greater-or-equal */
+    int      zwrite;         /* !ZMSK */
+    uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
+    int      zbw;            /* ZBW: width in pixels */
 } psp_draw_state;
 
 typedef struct {
@@ -120,7 +129,7 @@ void     psp_render_reset_pixels(void);
 uint32_t psp_color_expand(uint32_t px, int fmt);
 
 /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.
- * DXT formats are not decoded: they return opaque magenta and are counted. */
+ * Anything undecodable returns opaque magenta and is counted. */
 uint32_t psp_tex_fetch(const psp_draw_state *st, int x, int y);
 uint64_t psp_render_unsupported_texels(void);
 
