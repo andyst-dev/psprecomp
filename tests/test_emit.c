@@ -867,6 +867,29 @@ static void check_link_branch_is_a_call(void) {
     }
 }
 
+/* ---- a jump's delay slot that another body owns ----------------------------
+ *
+ *   08804000  addiu  $sp, $sp, -16
+ *   08804004  jr     $ra
+ *   08804008  addiu  $sp, $sp, 16      <- also seeded as an entry
+ *
+ * Discovery can make a delay slot an entry: Pendemonium builds the struct
+ * offset 0x44AF0 with lui/ori, which looks like a code address and lands on
+ * the slot of a `jr $ra`. The slot then belongs to its own body, and the
+ * `jr $ra` was emitted without it, so every call leaked the 16-byte frame. */
+static const uint32_t JR_FOREIGN_SLOT[] = { 0x27BDFFF0u, 0x03E00008u, 0x27BD0010u };
+
+static void check_jump_runs_foreign_slot(void) {
+    const uint32_t seeds[2] = { BASE, BASE + 8 };
+    char *src = emit_synthetic("t_fslot", JR_FOREIGN_SLOT, 3, seeds, 2, NULL);
+    if (src) {
+        expect_order(src, "psp_body_08804000(uint32_t _entry)", "r_sp = r_sp + 16;",
+                     "PSP_SP_CHECK(0x08804004u);",
+                     "jr $ra runs a delay slot that another body owns");
+        free(src);
+    }
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -1094,6 +1117,7 @@ int main(void) {
     check_get_pc_is_not_a_call();
     check_jr_ra_continuation();
     check_link_branch_is_a_call();
+    check_jump_runs_foreign_slot();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

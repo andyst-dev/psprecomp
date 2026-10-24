@@ -239,6 +239,17 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
     [A_VMIDT]    = { "vmidt",    F_VD_VS },
     [A_VMZERO]   = { "vmzero",   F_VD_VS },
     [A_VMONE]    = { "vmone",    F_VD_VS },
+    [A_VI2UC]    = { "vi2uc",    F_VD_VS },
+    [A_VI2C]     = { "vi2c",     F_VD_VS },
+    [A_VI2US]    = { "vi2us",    F_VD_VS },
+    [A_VI2S]     = { "vi2s",     F_VD_VS },
+    [A_VUC2I]    = { "vuc2i",    F_VD_VS },
+    [A_VC2I]     = { "vc2i",     F_VD_VS },
+    [A_VUS2I]    = { "vus2i",    F_VD_VS },
+    [A_VS2I]     = { "vs2i",     F_VD_VS },
+    [A_VOCP]     = { "vocp",     F_VD_VS },
+    [A_VSGN]     = { "vsgn",     F_VD_VS },
+    [A_VNOP]     = { "vnop",     F_NONE },
     [A_VPFXS]    = { "vpfxs",    F_UNKNOWN },
     [A_VPFXT]    = { "vpfxt",    F_UNKNOWN },
     [A_VPFXD]    = { "vpfxd",    F_UNKNOWN },
@@ -645,8 +656,26 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         case 0x13: op = A_VF2ID; break;
         case 0x14: op = A_VI2F;  break;
         case 0x15: op = A_VCMOV; break;
-        /* VFPU7 (rs=1) and VFPU9 (rs=2) are the conversion and shuffle
-         * tables; mapped but not broken out yet. */
+        case 0x01:                                  /* VFPU7: integer packing */
+            switch (RT_F(word)) {
+            case 0x18: op = A_VUC2I; break;
+            case 0x19: op = A_VC2I;  break;
+            case 0x1A: op = A_VUS2I; break;
+            case 0x1B: op = A_VS2I;  break;
+            case 0x1C: op = A_VI2UC; break;
+            case 0x1D: op = A_VI2C;  break;
+            case 0x1E: op = A_VI2US; break;
+            case 0x1F: op = A_VI2S;  break;
+            default:   op = A_VFPU_UNKNOWN; break;
+            }
+            break;
+        case 0x02:                                  /* VFPU9 */
+            switch (RT_F(word)) {
+            case 0x04: op = A_VOCP; break;
+            case 0x0A: op = A_VSGN; break;
+            default:   op = A_VFPU_UNKNOWN; break;
+            }
+            break;
         default:   op = A_VFPU_UNKNOWN; break;
         }
         break;
@@ -676,8 +705,12 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
         }
         break;
 
+    case 0x3F:
+        op = (word == 0xFFFF0000u || word == 0xFFFF0320u || word == 0xFFFF040Du)
+             ? A_VNOP : A_VFPU_UNKNOWN;           /* vnop, vsync, vflush */
+        break;
     case 0x1C: case 0x1D: case 0x1E:
-    case 0x35: case 0x3D: case 0x3F:
+    case 0x35: case 0x3D:
         op = A_VFPU_UNKNOWN;
         break;
 

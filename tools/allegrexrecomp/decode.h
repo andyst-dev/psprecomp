@@ -94,6 +94,11 @@ typedef enum {
     /* VFPU6 (opcode 0x3C): the matrix unit. */
     A_VMMUL, A_VTFM2, A_VTFM3, A_VTFM4, A_VMSCL, A_VCRSP, A_VROT,
     A_VMMOV, A_VMIDT, A_VMZERO, A_VMONE,
+    /* VFPU7 (0x34, rs=1): integer packing; VFPU9 (rs=2): vocp, vsgn. */
+    A_VI2UC, A_VI2C, A_VI2US, A_VI2S, A_VUC2I, A_VC2I, A_VUS2I, A_VS2I,
+    A_VOCP, A_VSGN,
+    /* 0xFFFFxxxx: vnop, vsync, vflush. Nothing to do in a recompiled program. */
+    A_VNOP,
     /* Any VFPU encoding we recognise as VFPU but do not yet name. Emitting
      * these is a hard error rather than a silent wrong answer. */
     A_VIIM,

@@ -40,9 +40,8 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
     g_traps++;
 }
 
-/* Consume the pending prefixes. Returns 1 if it is safe to compute, 0 if a
- * prefix was pending -- in which case the caller must trap rather than produce
- * a number that ignores it. */
+/* The matrix ops do not apply prefixes. A pending one makes them trap rather
+ * than compute a number that ignores it; WTF never prefixes a matrix op. */
 static int take_prefixes(uint32_t addr, const char *what) {
     if (!psp_vfpu_prefix_pending()) return 1;
     memset(g_prefix_set, 0, sizeof g_prefix_set);
@@ -50,22 +49,25 @@ static int take_prefixes(uint32_t addr, const char *what) {
     return 0;
 }
 
+/* Every vector op consumes the prefixes, whether or not they were set. */
+static void end_op(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
+
 /* ---- register addressing ------------------------------------------------- */
 
-int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
-    const int mtx       = (vreg >> 2) & 7;
-    const int col       = vreg & 3;
-    int transpose       = (vreg >> 5) & 1;
-    int row = 0, len = 1;
+/* All four lanes from a register's first lane on, in its direction. A prefix
+ * swizzle can name lanes past the operand's size, so a pair or a single still
+ * has four. */
+static void lanes4(uint32_t vreg, int size, int out[4]) {
+    const int mtx = (vreg >> 2) & 7;
+    const int col = vreg & 3;
+    int transpose = (vreg >> 5) & 1, row;
 
     switch (size) {
-    case 1: row = (vreg >> 5) & 3; transpose = 0; len = 1; break;
-    case 2: row = (vreg >> 5) & 2;                len = 2; break;
-    case 3: row = (vreg >> 6) & 1;                len = 3; break;
-    default:row = (vreg >> 5) & 2;                len = 4; break;
+    case 1:  row = (vreg >> 5) & 3; transpose = 0; break;
+    case 3:  row = (vreg >> 6) & 1;                break;
+    default: row = (vreg >> 5) & 2;                break;
     }
-
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < 4; i++) {
         /* Transposed access walks columns instead of rows -- the same storage
          * seen the other way round, which is what makes a matrix transpose
          * free on this hardware. */
@@ -73,7 +75,106 @@ int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
         out[i] = transpose ? mtx * 4 + step * 32 + col
                            : mtx * 4 + col  * 32 + step;
     }
+}
+
+int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
+    int l[4];
+    const int len = size >= 1 && size <= 4 ? size : 4;
+    lanes4(vreg, len, l);
+    for (int i = 0; i < len; i++) out[i] = l[i];
     return len;
+}
+
+/* ---- prefixes -------------------------------------------------------------
+ *
+ * vpfxs / vpfxt rewrite each source lane i (bits for lane i):
+ *   swizzle  1..0 + 2i   which lane of the register to read
+ *   abs      8 + i       take its absolute value
+ *   const    12 + i      ignore the register: a constant, indexed by
+ *                        swizzle | abs << 2, from PFX_CONST
+ *   negate   16 + i
+ * vpfxd post-processes each destination lane:
+ *   saturate 1..0 + 2i   1 clamps to [0, 1], 3 to [-1, 1]
+ *   mask     8 + i       do not write the lane at all
+ *
+ * WTF uses the source forms to broadcast a scalar (`vpfxt [x,x,x,x]` before a
+ * clamp's vmin/vmax), to build box corners (`vpfxs [-w,-w,-w,w]` on vmov),
+ * and to compare against |x| with a constant 0 lane. */
+static const float PFX_CONST[8] = {
+    0.0f, 1.0f, 2.0f, 0.5f, 3.0f, 1.0f / 3.0f, 0.25f, 1.0f / 6.0f
+};
+
+static float sat0(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
+
+/* Read an operand through prefix `which` (0 = s, 1 = t). */
+static void read_src(int which, uint32_t vreg, int size, float out[4]) {
+    int l[4];
+    lanes4(vreg, size, l);
+    if (!g_prefix_set[which]) {
+        for (int i = 0; i < size; i++) out[i] = psp_cpu.v[l[i]];
+        return;
+    }
+    const uint32_t p = g_prefix[which];
+    for (int i = 0; i < size; i++) {
+        const int sw = (int)(p >> (2 * i)) & 3;
+        const int ab = (int)(p >> (8 + i)) & 1;
+        const int k  = (int)(p >> (12 + i)) & 1;
+        float x = k ? PFX_CONST[sw | (ab << 2)] : psp_cpu.v[l[sw]];
+        if (!k && ab) x = fabsf(x);
+        if ((p >> (16 + i)) & 1) x = -x;
+        out[i] = x;
+    }
+}
+
+/* Write a result through vpfxd. Called only after every source is read, since
+ * the destination may alias a source. */
+static void write_dst(uint32_t vreg, int size, const float in[4]) {
+    int l[4];
+    lanes4(vreg, size, l);
+    const uint32_t p = g_prefix_set[2] ? g_prefix[2] : 0;
+    for (int i = 0; i < size; i++) {
+        if ((p >> (8 + i)) & 1) continue;
+        float x = in[i];
+        switch ((p >> (2 * i)) & 3) {
+        case 1: x = sat0(x); break;
+        case 3: x = sat1(x); break;
+        default: break;
+        }
+        psp_cpu.v[l[i]] = x;
+    }
+}
+
+/* ---- moves between the integer and vector files --------------------------
+ *
+ * mfv/mtv name a single lane with the low 7 bits; with bit 7 set they are
+ * mfvc/mtvc and name a control register instead: 0-2 the prefixes, 3 the
+ * condition codes that vcmp writes (WTF reads them this way after vcmp). */
+uint32_t psp_mfv(uint32_t reg) {
+    if (reg & 0x80) {
+        switch (reg & 0x7F) {
+        case 0: case 1: case 2: return g_prefix[reg & 3];
+        case 3:  return psp_cpu.vfpu_cc;
+        default: return 0;
+        }
+    }
+    int l[4];
+    lanes4(reg & 0x7F, 1, l);
+    return psp_f32_to_bits(psp_cpu.v[l[0]]);
+}
+
+void psp_mtv(uint32_t reg, uint32_t bits) {
+    if (reg & 0x80) {
+        switch (reg & 0x7F) {
+        case 0: case 1: case 2: psp_vfpu_set_prefix((int)(reg & 3), bits & 0xFFFFFu); break;
+        case 3:  psp_cpu.vfpu_cc = bits & 0x3F; break;
+        default: break;
+        }
+        return;
+    }
+    int l[4];
+    lanes4(reg & 0x7F, 1, l);
+    psp_cpu.v[l[0]] = psp_bits_to_f32(bits);
 }
 
 /* ---- load / store -------------------------------------------------------- */
@@ -110,20 +211,15 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
 
 #define BINOP(name, expr)                                                    \
     void psp_##name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {       \
-        if (!take_prefixes(psp_cpu.pc, #name)) return;                       \
-        int d[4], s[4], t[4];                                                \
-        int n = psp_vfpu_regs(vd, size, d);                                  \
-        psp_vfpu_regs(vs, size, s);                                          \
-        psp_vfpu_regs(vt, size, t);                                          \
-        /* Read every source before writing any destination: vd may alias vs \
-         * or vt, and a lane-by-lane read/write would then feed results back  \
-         * into later lanes. */                                              \
-        float out[4];                                                        \
-        for (int i = 0; i < n; i++) {                                        \
-            float a = psp_cpu.v[s[i]], b = psp_cpu.v[t[i]];                  \
+        float s[4], t[4], out[4];                                            \
+        read_src(0, vs, size, s);                                            \
+        read_src(1, vt, size, t);                                            \
+        for (int i = 0; i < size; i++) {                                     \
+            const float a = s[i], b = t[i];                                  \
             out[i] = (expr);                                                 \
         }                                                                    \
-        for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = out[i];                \
+        write_dst(vd, size, out);                                            \
+        end_op();                                                            \
     }
 
 BINOP(vadd, a + b)
@@ -132,38 +228,90 @@ BINOP(vmul, a * b)
 BINOP(vdiv, a / b)
 BINOP(vmin, a < b ? a : b)
 BINOP(vmax, a > b ? a : b)
+BINOP(vsge, a >= b ? 1.0f : 0.0f)
+BINOP(vslt, a < b ? 1.0f : 0.0f)
+BINOP(vscmp, a < b ? -1.0f : (a > b ? 1.0f : 0.0f))
 
 /* Dot product: sums all lanes into a single destination lane. */
 void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vdot")) return;
-    int d[4], s[4], t[4];
-    psp_vfpu_regs(vd, 1, d);
-    int n = psp_vfpu_regs(vs, size, s);
-    psp_vfpu_regs(vt, size, t);
+    float s[4], t[4], out[4] = { 0 };
+    read_src(0, vs, size, s);
+    read_src(1, vt, size, t);
+    for (int i = 0; i < size; i++) out[0] += s[i] * t[i];
+    write_dst(vd, 1, out);
+    end_op();
+}
 
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) sum += psp_cpu.v[s[i]] * psp_cpu.v[t[i]];
-    psp_cpu.v[d[0]] = sum;
+/* Homogeneous dot: the last lane of vs counts as 1, so a point (x, y, z, 1)
+ * dotted with a plane (a, b, c, d) needs no fourth component stored. */
+void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float s[4], t[4], out[4] = { 0 };
+    read_src(0, vs, size, s);
+    read_src(1, vt, size, t);
+    for (int i = 0; i < size - 1; i++) out[0] += s[i] * t[i];
+    out[0] += t[size - 1];
+    write_dst(vd, 1, out);
+    end_op();
 }
 
 /* Scale: every lane of vs multiplied by the scalar in vt. */
 void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vscl")) return;
-    int d[4], s[4], t[4];
-    int n = psp_vfpu_regs(vd, size, d);
-    psp_vfpu_regs(vs, size, s);
-    psp_vfpu_regs(vt, 1, t);
+    float s[4], t[4], out[4];
+    read_src(0, vs, size, s);
+    read_src(1, vt, 1, t);
+    for (int i = 0; i < size; i++) out[i] = s[i] * t[0];
+    write_dst(vd, size, out);
+    end_op();
+}
 
-    const float k = psp_cpu.v[t[0]];
-    float out[4];
-    for (int i = 0; i < n; i++) out[i] = psp_cpu.v[s[i]] * k;
-    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = out[i];
+/* vcrs.t is half a cross product, (s.y t.z, s.z t.x, s.x t.y); a game
+ * subtracts the other half itself. vcrsp.t is the whole one, and at quad size
+ * the same encoding is vqmul, the quaternion product. */
+void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float s[4], t[4], out[4];
+    (void)size;
+    read_src(0, vs, 3, s);
+    read_src(1, vt, 3, t);
+    out[0] = s[1] * t[2];
+    out[1] = s[2] * t[0];
+    out[2] = s[0] * t[1];
+    write_dst(vd, 3, out);
+    end_op();
+}
+
+void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float s[4], t[4], out[4];
+    if (size == 4) {
+        read_src(0, vs, 4, s);
+        read_src(1, vt, 4, t);
+        out[0] = s[0] * t[3] + s[1] * t[2] - s[2] * t[1] + s[3] * t[0];
+        out[1] = -s[0] * t[2] + s[1] * t[3] + s[2] * t[0] + s[3] * t[1];
+        out[2] = s[0] * t[1] - s[1] * t[0] + s[2] * t[3] + s[3] * t[2];
+        out[3] = -s[0] * t[0] - s[1] * t[1] - s[2] * t[2] + s[3] * t[3];
+        write_dst(vd, 4, out);
+    } else {
+        read_src(0, vs, 3, s);
+        read_src(1, vt, 3, t);
+        out[0] = s[1] * t[2] - s[2] * t[1];
+        out[1] = s[2] * t[0] - s[0] * t[2];
+        out[2] = s[0] * t[1] - s[1] * t[0];
+        write_dst(vd, 3, out);
+    }
+    end_op();
+}
+
+/* 2x2 determinant of the pairs vs and vt, into one lane. */
+void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+    float s[4], t[4], out[4] = { 0 };
+    (void)size;
+    read_src(0, vs, 2, s);
+    read_src(1, vt, 2, t);
+    out[0] = s[0] * t[1] - s[1] * t[0];
+    write_dst(vd, 1, out);
+    end_op();
 }
 
 /* ---- unary element-wise ops (VFPU4) -------------------------------------- */
-
-static float sat0(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
-static float sat1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
 
 /* Round half to even, without depending on the host's rounding mode. */
 static double round_even(double v) {
@@ -199,15 +347,11 @@ static float i2f(uint32_t bits, int scale) {
 }
 
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vunary")) return;
+    float s[4], out[4];
+    read_src(0, vs, size, s);
 
-    int d[4], s[4];
-    int n = psp_vfpu_regs(vd, size, d);
-    psp_vfpu_regs(vs, size, s);
-
-    float out[4];
-    for (int i = 0; i < n; i++) {
-        const float a = psp_cpu.v[s[i]];
+    for (int i = 0; i < size; i++) {
+        const float a = s[i];
         float r;
         switch (op) {
         case PSP_VU_MOV:  r = a;            break;
@@ -232,35 +376,113 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
         case PSP_VU_LOG2: r = logf(a) * 1.4426950408889634f; break;   /* 1/ln2 */
         case PSP_VU_SAT0: r = sat0(a);      break;
         case PSP_VU_SAT1: r = sat1(a);      break;
+        case PSP_VU_OCP:  r = 1.0f - a;     break;
+        case PSP_VU_SGN:  r = a > 0 ? 1.0f : (a < 0 ? -1.0f : 0.0f); break;
         /* Conversions move between the float and integer *interpretations* of
          * a vector register; the bits are reinterpreted, not just cast. */
         case PSP_VU_F2IZ: r = psp_bits_to_f32(f2i(a, 0, op)); break;
         case PSP_VU_I2F:  r = i2f(psp_f32_to_bits(a), 0);     break;
-        default:          psp_vfpu_unimplemented(psp_cpu.pc, "vunary"); return;
+        default:          psp_vfpu_unimplemented(psp_cpu.pc, "vunary"); end_op(); return;
         }
         out[i] = r;
     }
-    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = out[i];
+    write_dst(vd, size, out);
+    end_op();
 }
 
 void psp_vcvt(int op, uint32_t vd, uint32_t vs, int size, int scale) {
-    if (!take_prefixes(psp_cpu.pc, op == PSP_VU_I2F ? "vi2f" : "vf2i")) return;
-
-    int d[4], s[4];
-    int n = psp_vfpu_regs(vd, size, d);
-    psp_vfpu_regs(vs, size, s);
-
-    float out[4];
-    for (int i = 0; i < n; i++) {
-        const float a = psp_cpu.v[s[i]];
+    float s[4], out[4];
+    read_src(0, vs, size, s);
+    for (int i = 0; i < size; i++) {
+        const float a = s[i];
         switch (op) {
         case PSP_VU_F2IN: case PSP_VU_F2IZ: case PSP_VU_F2IU: case PSP_VU_F2ID:
                           out[i] = psp_bits_to_f32(f2i(a, scale, op)); break;
         case PSP_VU_I2F:  out[i] = i2f(psp_f32_to_bits(a), scale);    break;
-        default:          psp_vfpu_unimplemented(psp_cpu.pc, "vcvt"); return;
+        default:          psp_vfpu_unimplemented(psp_cpu.pc, "vcvt"); end_op(); return;
         }
     }
-    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = out[i];
+    write_dst(vd, size, out);
+    end_op();
+}
+
+/* Packing and unpacking integer lanes (VFPU7). These work on the integer bit
+ * patterns the vf2i conversions leave in the registers, and change the lane
+ * count: vi2uc.q packs four lanes into the bytes of one, vs2i.p unpacks the
+ * halfwords of two lanes into four. The narrowing forms keep the top bits of
+ * each value, and the unsigned ones clamp negatives to zero.
+ *
+ * WTF's colour helper at 0x318D8 is `vsat0; vscl 255*2^23; vf2iz; vi2uc; mfv`:
+ * floats in [0, 1] to a packed 8888 colour. Unimplemented, it returned whatever
+ * $v0 already held, and every menu glyph was drawn in a "colour" that was the
+ * display-list pointer, alpha 9 -- below the alpha test, so no text. */
+void psp_vpack(int op, uint32_t vd, uint32_t vs, int size) {
+    int sl[4], dl[4];
+    uint32_t in[4], out[4] = { 0 };
+    int nout;
+    lanes4(vs, size, sl);
+    for (int i = 0; i < size; i++) in[i] = psp_f32_to_bits(psp_cpu.v[sl[i]]);
+
+    switch (op) {
+    case PSP_VP_I2UC: case PSP_VP_I2C:            /* quad -> single */
+        for (int i = 0; i < 4; i++) {
+            const int32_t v = (int32_t)in[i];
+            const uint32_t b = op == PSP_VP_I2UC ? (v < 0 ? 0u : ((uint32_t)v >> 23) & 0xFF)
+                                                 : ((uint32_t)v >> 24) & 0xFF;
+            out[0] |= b << (8 * i);
+        }
+        nout = 1;
+        break;
+    case PSP_VP_I2US: case PSP_VP_I2S:            /* pairs of lanes -> one */
+        nout = size / 2;
+        for (int i = 0; i < nout * 2; i++) {
+            const int32_t v = (int32_t)in[i];
+            const uint32_t h = op == PSP_VP_I2US ? (v < 0 ? 0u : ((uint32_t)v >> 15) & 0xFFFF)
+                                                 : ((uint32_t)v >> 16) & 0xFFFF;
+            out[i / 2] |= h << (16 * (i & 1));
+        }
+        break;
+    case PSP_VP_UC2I: case PSP_VP_C2I:            /* single -> quad */
+        for (int i = 0; i < 4; i++) {
+            const uint32_t b = (in[0] >> (8 * i)) & 0xFF;
+            out[i] = op == PSP_VP_UC2I ? (b * 0x01010101u) >> 1 : b << 24;
+        }
+        nout = 4;
+        break;
+    default:                                      /* US2I, S2I: one lane -> two */
+        nout = size * 2;
+        if (nout > 4) nout = 4;
+        for (int i = 0; i < nout; i++) {
+            const uint32_t h = (in[i / 2] >> (16 * (i & 1))) & 0xFFFF;
+            out[i] = op == PSP_VP_US2I ? h << 15 : h << 16;
+        }
+        break;
+    }
+    if (nout < 1) nout = 1;
+    lanes4(vd, nout, dl);
+    const uint32_t mask = g_prefix_set[2] ? g_prefix[2] : 0;
+    for (int i = 0; i < nout; i++)
+        if (!((mask >> (8 + i)) & 1)) psp_cpu.v[dl[i]] = psp_bits_to_f32(out[i]);
+    end_op();
+}
+
+/* vrot: a row of a rotation matrix from one angle, in quarter turns. The
+ * immediate places cos in lane imm[1:0] and sin in lane imm[3:2], negated if
+ * imm[4]; other lanes are 0. If both name the same lane, cos goes there and
+ * every other lane gets sin. WTF builds its rotation matrices this way: vmidt,
+ * two vrot rows, vmmul. */
+void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size) {
+    float a[4], out[4];
+    read_src(0, vs, 1, a);
+    const float ang = a[0] * 1.5707963267948966f;
+    float sn = sinf(ang);
+    const float cs = cosf(ang);
+    if (imm & 0x10) sn = -sn;
+    const int ci = (int)(imm & 3), si = (int)((imm >> 2) & 3);
+    for (int i = 0; i < size; i++)
+        out[i] = i == ci ? cs : (si == ci || i == si) ? sn : 0.0f;
+    write_dst(vd, size, out);
+    end_op();
 }
 
 /* ---- matrix ops without a multiply --------------------------------------- */
@@ -308,18 +530,22 @@ void psp_vmidt(uint32_t vd, int size) {
 
 /* vidt -- an identity *vector*: all zeroes but for a single 1.0.
  *
- * Which element gets the 1 is encoded in the destination register number
- * rather than given as an operand, which is how one instruction builds any
- * basis vector. Bits 6-7 of vd select the position.
+ * The register names a column (or, transposed, a row) of a matrix, and vidt
+ * writes that column of the identity: the 1 goes in the lane equal to the
+ * register's column index, vd & 3 (vd & 1 for a pair). `vidt.q C730` is
+ * (0, 0, 0, 1).
  *
- * This is matrix-setup code. Trapping it to a no-op leaves whatever was in the
- * register, so downstream geometry is built on a basis that is not a basis. */
+ * WTF's VFPU setup at 0x315BC does exactly that and then relies on it: s733
+ * (= 1.0) is the "1" in its quaternion-to-matrix routine's 1 - 2(y^2 + z^2),
+ * and C730 is the w = 1 its frustum corners are built from. Bits 6-7, used
+ * before, gave (1, 0, 0, 0), so every animated node came out with a zero 3x3
+ * and the whole instructions screen collapsed to a point. */
 void psp_vidt(uint32_t vd, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vidt")) return;
-    int d[4];
-    int n = psp_vfpu_regs(vd, size, d);
-    const int one = (int)((vd >> 6) & 3);
-    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = (i == one) ? 1.0f : 0.0f;
+    float out[4];
+    const int one = (int)(vd & (size == 2 ? 1u : 3u));
+    for (int i = 0; i < size; i++) out[i] = (i == one) ? 1.0f : 0.0f;
+    write_dst(vd, size, out);
+    end_op();
 }
 
 /* vcst -- load a constant from the VFPU's built-in table.
@@ -327,8 +553,6 @@ void psp_vidt(uint32_t vd, int size) {
  * The index is in the vs field. Values follow the hardware table; index 0 is
  * zero and anything past the end reads as zero rather than as garbage. */
 void psp_vcst(uint32_t vd, uint32_t which, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vcst")) return;
-
     static const float K[20] = {
         0.0f,
         3.4028235e38f,          /* max float          */
@@ -353,9 +577,9 @@ void psp_vcst(uint32_t vd, uint32_t which, int size) {
     };
 
     const float k = which < 20 ? K[which] : 0.0f;
-    int d[4];
-    int n = psp_vfpu_regs(vd, size, d);
-    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = k;
+    float out[4] = { k, k, k, k };
+    write_dst(vd, size, out);
+    end_op();
 }
 
 void psp_vmzero(uint32_t vd, int size) {
@@ -453,17 +677,18 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 }
 
 /* Compare, writing one condition bit per lane plus the any/all summary bits
- * that vcmov and the bvt/bvf branches read. */
+ * that vcmov and the bvt/bvf branches read. Conditions 8-15 test vs alone:
+ * zero, NaN, infinity, and NaN-or-infinity, then the same four negated. */
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
-    if (!take_prefixes(psp_cpu.pc, "vcmp")) return;
-    int s[4], t[4];
-    int n = psp_vfpu_regs(vs, size, s);
-    psp_vfpu_regs(vt, size, t);
+    float s[4], t[4];
+    read_src(0, vs, size, s);
+    read_src(1, vt, size, t);
 
     uint32_t cc = 0;
     int all = 1, any = 0;
-    for (int i = 0; i < n; i++) {
-        float a = psp_cpu.v[s[i]], b = psp_cpu.v[t[i]];
+    for (int i = 0; i < size; i++) {
+        const float a = s[i], b = t[i];
+        const int nan = a != a, inf = isinf(a) != 0;
         int r;
         switch (cond & 0xF) {
         case 0:  r = 0;              break;   /* FL  */
@@ -474,13 +699,21 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
         case 5:  r = (a != b);       break;   /* NE  */
         case 6:  r = (a >= b);       break;   /* GE  */
         case 7:  r = (a >  b);       break;   /* GT  */
-        default: r = 0;              break;
+        case 8:  r = (a == 0.0f);    break;   /* EZ  */
+        case 9:  r = nan;            break;   /* EN  */
+        case 10: r = inf;            break;   /* EI  */
+        case 11: r = nan || inf;     break;   /* ES  */
+        case 12: r = (a != 0.0f);    break;   /* NZ  */
+        case 13: r = !nan;           break;   /* NN  */
+        case 14: r = !inf;           break;   /* NI  */
+        default: r = !(nan || inf);  break;   /* NS  */
         }
         if (r) { cc |= 1u << i; any = 1; } else { all = 0; }
     }
     if (any) cc |= 1u << 4;
     if (all) cc |= 1u << 5;
     psp_cpu.vfpu_cc = cc;
+    end_op();
 }
 
 /* viim / vfim -- write a single lane from an immediate encoded in the
