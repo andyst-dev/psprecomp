@@ -117,6 +117,7 @@ typedef struct {
     uint32_t attr;
     uint32_t arglen;       /* sceKernelStartThread arguments, held for the host */
     uint32_t argp;
+    uint32_t gp;           /* the creator's $gp, which the thread starts with */
     int      state;
     uint32_t exit_status;
     int      used;
@@ -789,6 +790,7 @@ static void *guest_thread_main(void *arg) {
      * ran before it. $sp and the o32 argument registers are the firmware's to
      * set, everything else starts at zero. */
     psp_cpu_reset();
+    psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
     psp_cpu.r[PSP_REG_A0] = t->arglen;
     psp_cpu.r[PSP_REG_A1] = t->argp;
     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
@@ -878,6 +880,7 @@ static void hle_CreateThread(void) {
     t->priority   = psp_arg(2);
     t->stack_size = psp_arg(3);
     t->attr       = psp_arg(4);
+    t->gp         = psp_cpu.r[PSP_REG_GP];
 
     if (t->stack_size < 0x1000) t->stack_size = 0x1000;
     /* Stacks grow down, so allocate from the top of the heap: a stack that
