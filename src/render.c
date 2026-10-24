@@ -9,8 +9,8 @@
  * game's.
  *
  * Per pixel, in order: clear mode short-circuits everything; otherwise vertex
- * colour, texture function, alpha test, blend, write. Depth, stencil, fog,
- * dithering, colour test and logic ops are not implemented.
+ * colour, texture function, alpha test, depth test, blend, write. Stencil,
+ * fog, dithering, colour test and logic ops are not implemented.
  */
 
 #include "psprecomp/render.h"
@@ -113,13 +113,60 @@ static int wrap(int c, int size, int clamp) {
     return c & (size - 1);                      /* sizes are powers of two */
 }
 
+/* DXT1/3/5. The PSP lays a block out with its colour indices first -- one
+ * byte per row, two bits per texel -- then the two 565 endpoint colours, the
+ * reverse of the desktop order. DXT3 and DXT5 follow the colour half with
+ * their alpha half. Blocks run left to right in rows of tex_bw / 4.
+ * ponytail: DXT1 is checked against WTF's backgrounds; the DXT5 alpha layout
+ * (endpoints in the last two bytes) is not yet seen in a game. */
+static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
+    const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
+    const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
+    const uint32_t i = (y & 3) * 4 + (x & 3);
+
+    const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
+    const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
+    uint32_t out;
+    switch ((psp_read32(blk) >> (2 * i)) & 3) {
+    case 0:  out = a; break;
+    case 1:  out = b; break;
+    case 2:
+        out = c0 > c1 || st->tex_fmt != PSP_TPSM_DXT1
+            ? rgba((2 * R(a) + R(b)) / 3, (2 * G(a) + G(b)) / 3, (2 * B(a) + B(b)) / 3, 255)
+            : rgba((R(a) + R(b)) / 2, (G(a) + G(b)) / 2, (B(a) + B(b)) / 2, 255);
+        break;
+    default:
+        out = c0 > c1 || st->tex_fmt != PSP_TPSM_DXT1
+            ? rgba((R(a) + 2 * R(b)) / 3, (G(a) + 2 * G(b)) / 3, (B(a) + 2 * B(b)) / 3, 255)
+            : 0;                                /* DXT1 three-colour mode: transparent */
+        break;
+    }
+    if (st->tex_fmt == PSP_TPSM_DXT3) {
+        const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
+        out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
+    } else if (st->tex_fmt == PSP_TPSM_DXT5) {
+        const uint64_t bits = (uint64_t)psp_read16(blk + 12) | ((uint64_t)psp_read32(blk + 8) << 16);
+        const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
+        const int k = (int)(bits >> (3 * i)) & 7;
+        int al;
+        if (k == 0) al = a0;
+        else if (k == 1) al = a1;
+        else if (a0 > a1) al = ((8 - k) * a0 + (k - 1) * a1) / 7;
+        else if (k < 6) al = ((6 - k) * a0 + (k - 1) * a1) / 5;
+        else al = k == 6 ? 0 : 255;
+        out = (out & 0x00FFFFFFu) | ((uint32_t)al << 24);
+    }
+    return out;
+}
+
 uint32_t psp_tex_fetch(const psp_draw_state *st, int x, int y) {
-    if (st->tex_fmt > PSP_TPSM_T32 || st->tex_w <= 0 || st->tex_h <= 0 || st->tex_bw <= 0) {
+    if (st->tex_fmt > PSP_TPSM_DXT5 || st->tex_w <= 0 || st->tex_h <= 0 || st->tex_bw <= 0) {
         g_bad_texels++;
-        return 0xFFFF00FFu;                     /* DXT or nonsense: loud magenta */
+        return 0xFFFF00FFu;                     /* nonsense: loud magenta */
     }
     x = wrap(x, st->tex_w, st->tex_clamp_u);
     y = wrap(y, st->tex_h, st->tex_clamp_v);
+    if (st->tex_fmt >= PSP_TPSM_DXT1) return dxt_texel(st, (uint32_t)x, (uint32_t)y);
 
     const int bpp = TEX_BPP[st->tex_fmt];
     const uint32_t at = st->tex_addr + tex_offset(st, (uint32_t)x * (uint32_t)bpp / 8, (uint32_t)y);
@@ -246,18 +293,38 @@ static uint32_t fb_read(uint32_t at) {
     return g_fb_fmt == 3 ? psp_read32(at) : psp_color_expand(psp_read16(at), g_fb_fmt);
 }
 
-/* One fragment through the pipeline. `c` is the interpolated vertex colour. */
-static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u, float v) {
+static int depth_pass(int func, int z, int d) {
+    switch (func) {
+    case 0:  return 0;
+    case 1:  return 1;
+    case 2:  return z == d;
+    case 3:  return z != d;
+    case 4:  return z < d;
+    case 5:  return z <= d;
+    case 6:  return z > d;
+    default: return z >= d;
+    }
+}
+
+/* One fragment through the pipeline. `c` is the interpolated vertex colour,
+ * `zf` its depth. */
+static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u, float v, float zf) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
     if (x < st->sc_x0 || x > st->sc_x1 || y < st->sc_y0 || y > st->sc_y1) return;
 
     const uint32_t bytes = g_fb_fmt == 3 ? 4u : 2u;
     const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * bytes;
+    /* Rounded: coplanar layers (WTF draws LED text on its panel at the same
+     * depth) must compare equal, and interpolation lands either side of it. */
+    const int z = zf < 0.0f ? 0 : (zf > 65535.0f ? 65535 : (int)(zf + 0.5f));
+    const uint32_t zat = st->zaddr + (uint32_t)(y * st->zbw + x) * 2u;
+    const int have_z = st->zaddr && st->zbw > 0;
 
     if (st->clear) {
-        /* Clear mode writes only the buffers its flags name; depth (bit 10)
-         * has no buffer here. A depth-only clear leaves the colour alone. */
+        /* Clear mode writes only the buffers its flags name. A depth-only
+         * clear leaves the colour alone. */
+        if (st->clear_depth && have_z) psp_write16(zat, (uint16_t)z);
         if (!st->clear_color && !st->clear_alpha) return;
         if (!st->clear_color || !st->clear_alpha) {
             uint32_t d = fb_read(at);
@@ -272,6 +339,10 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
             c = tex_combine(st, psp_tex_fetch(st, tx, ty), c);
         }
         if (st->atest && !alpha_pass(st, c)) return;
+        if (st->ztest && have_z) {
+            if (!depth_pass(st->zfunc, z, psp_read16(zat))) return;
+            if (st->zwrite) psp_write16(zat, (uint16_t)z);
+        }
         if (st->blend) c = blend(st, c, fb_read(at));
     }
 
@@ -296,6 +367,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
     int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
 
+    if (a->behind || b->behind || c->behind) return;   /* ponytail: no near-plane clipping */
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
     if (maxx > 479) maxx = 479;
@@ -304,6 +376,14 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const int area = edge(a, b, c->x, c->y);
     if (area == 0) return;
     const float inv = 1.0f / (float)area;
+    /* Coverage is decided on the integer grid; attributes are sampled at the
+     * pixel centre, half a pixel on, as the GE does. Sampled at the corner, a
+     * row lands exactly on a texel edge, float error floors it to the texel
+     * before, and WTF's LED panels -- dots on every other texel row -- lost
+     * whole rows of dots. */
+    const float h0 = 0.5f * (float)((b->x - a->x) - (b->y - a->y));
+    const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
+    const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
 
     for (int y = miny; y <= maxy; y++) {
         for (int x = minx; x <= maxx; x++) {
@@ -312,7 +392,7 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             int w2 = edge(c, a, x, y);   /* weight of b */
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
-            float la = (float)w1 * inv, lb = (float)w2 * inv, lc = (float)w0 * inv;
+            float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
             uint32_t col = c->rgba;
             if (st->gouraud) {
                 col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),
@@ -322,7 +402,8 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
             }
             fragment(st, x, y, col,
                      a->u * la + b->u * lb + c->u * lc,
-                     a->v * la + b->v * lb + c->v * lc);
+                     a->v * la + b->v * lb + c->v * lc,
+                     a->z * la + b->z * lb + c->z * lc);
         }
     }
 }
@@ -339,8 +420,8 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b, const psp_draw_s
     const float dv = (b->v - a->v) / (float)(b->y - a->y);
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++)
-            fragment(st, x, y, b->rgba, a->u + (float)(x - a->x) * du,
-                     a->v + (float)(y - a->y) * dv);
+            fragment(st, x, y, b->rgba, a->u + ((float)(x - a->x) + 0.5f) * du,
+                     a->v + ((float)(y - a->y) + 0.5f) * dv, b->z);
 }
 
 static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {

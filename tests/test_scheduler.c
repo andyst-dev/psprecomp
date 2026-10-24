@@ -28,6 +28,9 @@ static void worker(void) {
     uint32_t token = psp_cpu.r[PSP_REG_A0];
     REQUIRE(psp_cpu.r[PSP_REG_A1] == 0x12345678u);
     REQUIRE((psp_cpu.r[PSP_REG_SP] & 15) == 0);
+    /* A thread starts with its creator's $gp: a module's globals are
+     * $gp-relative, and with 0 Pendemonium read its own code as data. */
+    REQUIRE(psp_cpu.r[PSP_REG_GP] == 0x08A0C870u);
     psp_cpu.r[PSP_REG_S2] = token;
     reached++;
     worker_rc = call("sceKernelWaitSema", sema, 1, 0, 0);
@@ -45,6 +48,7 @@ int main(void) {
     REQUIRE(psp_mem_init() == 0);
     psp_cpu_reset();
     psp_cpu.r[PSP_REG_SP] = 0x08810000u;
+    psp_cpu.r[PSP_REG_GP] = 0x08A0C870u;
     psp_hle_init();
     psp_register(0x08801000u, worker);
     psp_register(0x08801040u, exits);

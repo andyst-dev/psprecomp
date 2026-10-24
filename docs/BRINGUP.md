@@ -4584,9 +4584,57 @@ seconds of loading (the decompressor running to completion), then **a game of
 Lumberjack**, rendered correctly, and its paycheck screen when the round ends.
 0 bad memory accesses, 0 dispatch misses, no stack imbalance.
 
+## Pendemonium, menu text, and the load that was not a load (2026-10-24)
+
+The second game-sharing module, **Pendemonium** (`b04`), runs on the same
+harness: entry 0x0C0C, `$gp` 0x400BD0, constructor table at 0x3F7230 (found
+the same way as Lumberjack's: eight pointers, null-terminated, at the end of
+`.data`). Getting it from boot to a game took six fixes, every one also live
+in Lumberjack:
+
+1. **Threads started with `$gp` = 0.** Pendemonium's globals are
+   `$gp`-relative; it read its own instructions as pointers.
+2. **A `jr $ra` lost its delay slot.** `lui $at,4 / ori $at,$at,0x4AF0`
+   builds a struct offset; discovery promoted 0x44AF0 to an entry, which was
+   the slot of a `jr $ra`, and the emitter dropped slots it did not own on
+   `j`/`jr`. 16 bytes of stack leaked per call until a return address read
+   garbage.
+3. **VFPU gaps.** Prefixed ops trapped instead of computing, and `mfv`,
+   `vi2uc`, `vs2i`, `vrot`, `vcrsp` and others were not emitted. The menu
+   text was the visible symptom: the colour helper at 0x318D8 ends
+   `vi2uc; mfv $v0`, so glyphs were drawn in the display-list pointer's
+   "colour", alpha 9, below the alpha test. Found with a write watch on the
+   list word carrying the colour.
+4. **PRIM did not advance VADDR.** The menu draws runs of PRIMs from one
+   VADDR, so the LED text re-drew its first glyphs.
+5. **Texel rows off by one.** LED text is dots on every other texel row of a
+   1:1 quad. Sampled at pixel corners, v at row 2 came out 1.99999 and
+   floored to row 1. Found with a one-pixel trace of every fragment's decision.
+6. **`vidt` put its 1 in the wrong lane.** See below.
+
+The 3D game needed the renderer to grow lighting, a depth buffer, DXT and
+indexed drawing; the census of undecoded GE commands said which.
+
+**There was no 25-second load.** After the Job Share menu both games showed
+a grey screen for as long as the script waited, and the last entry here
+called that the decompressor loading. It was each microgame's **title card**,
+waiting for Start and drawn at a single point: every node's world matrix had
+a zero 3x3. The chain, followed by measurement: the GE world matrix came from
+a hierarchy multiply (0x39E50) of local matrices built from animation keys
+(0x36510) through a quaternion-to-matrix routine (0x37380) whose diagonal is
+`vsub v3, v127, v74`, 1 - 2z^2 with the 1 read from s733. The VFPU setup at
+0x315BC sets that with `vidt.q C730`, which we wrote as (1, 0, 0, 0). With it
+fixed the cards appear and Start begins a game within a few seconds.
+
+Result, real threads: Pendemonium's title card, a lit factory with pens on a
+belt, caps dropping onto them on Cross; Lumberjack's title card and game as
+before. 0 bad memory accesses, 0 dispatch misses.
+
 ## Next
 
-- Menu text renders as black boxes.
+- The menu's green LED line overlaps the first option bar; its position
+  comes straight from the game's vertices and is not checked against
+  hardware.
 - Sound is mixed but not played to a device.
-- Loading takes about 25 seconds; worth profiling.
-- Play the microgame with input, not just let it time out.
+- A window with controller input, rather than a scripted harness.
+- Near-plane clipping, fog, back-face culling, perspective-correct texturing.

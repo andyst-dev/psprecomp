@@ -19,16 +19,12 @@
  * and vscl/vmul/vadd/vdot another 18%. Those, plus the compare/min/max family,
  * are implemented here and unit-tested.
  *
- * The **prefix** instructions are not. `vpfxs`/`vpfxt`/`vpfxd` do not compute
- * anything -- they set a register that rewrites the *operands of the next
- * instruction*, swizzling lanes, negating, forcing constants, masking writes.
- * An arithmetic op executed while a prefix is pending computes something
- * different from the same op without one.
- *
- * So a pending prefix makes the next arithmetic op **trap** rather than
- * compute. Implementing the arithmetic while ignoring the prefixes would be
- * worse than not implementing it at all: it would produce numbers that are
- * silently wrong instead of an error that says so. Loud beats plausible.
+ * The **prefix** instructions `vpfxs`/`vpfxt`/`vpfxd` compute nothing: they
+ * set a register that rewrites the *operands of the next instruction*,
+ * swizzling lanes, negating, forcing constants, saturating and masking
+ * writes. Every vector op applies them (see src/vfpu.c). The matrix ops do
+ * not, and a pending prefix makes them trap rather than compute: an op that
+ * ignored its prefix would produce numbers that are silently wrong.
  */
 #ifndef PSPRECOMP_VFPU_H
 #define PSPRECOMP_VFPU_H
@@ -68,6 +64,34 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 /* Comparison, writing the VFPU condition codes. */
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
 
+/* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
+void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vslt(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vscmp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* Products: homogeneous dot, half and whole cross product (vcrsp at quad size
+ * is the quaternion product), 2x2 determinant. */
+void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+
+/* One row of a rotation matrix; `imm` is the instruction's bits 20..16. */
+void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size);
+
+/* Integer packing (VFPU7): narrowing vi2uc/vi2c/vi2us/vi2s, widening
+ * vuc2i/vc2i/vus2i/vs2i. `size` is the source operand's. */
+enum {
+    PSP_VP_I2UC = 0, PSP_VP_I2C, PSP_VP_I2US, PSP_VP_I2S,
+    PSP_VP_UC2I, PSP_VP_C2I, PSP_VP_US2I, PSP_VP_S2I
+};
+void psp_vpack(int op, uint32_t vd, uint32_t vs, int size);
+
+/* mfv / mtv, and mfvc / mtvc when bit 7 of `reg` is set (control registers:
+ * 0-2 the prefixes, 3 the condition codes). */
+uint32_t psp_mfv(uint32_t reg);
+void     psp_mtv(uint32_t reg, uint32_t bits);
+
 /* Unary element-wise ops (VFPU4). One entry point rather than eighteen, since
  * they differ only in the scalar function applied per lane. */
 enum {
@@ -76,7 +100,8 @@ enum {
     PSP_VU_EXP2, PSP_VU_LOG2, PSP_VU_SAT0, PSP_VU_SAT1,
     PSP_VU_NRCP, PSP_VU_NSIN, PSP_VU_REXP2, PSP_VU_ASIN,
     PSP_VU_F2IZ, PSP_VU_I2F,
-    PSP_VU_F2IN, PSP_VU_F2IU, PSP_VU_F2ID    /* psp_vcvt only */
+    PSP_VU_F2IN, PSP_VU_F2IU, PSP_VU_F2ID,   /* psp_vcvt only */
+    PSP_VU_OCP, PSP_VU_SGN                    /* 1 - x, sign(x) */
 };
 void psp_vunary(int op, uint32_t vd, uint32_t vs, int size);
 
@@ -102,8 +127,8 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 
-/* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next
- * arithmetic instruction. While any is pending, arithmetic traps. */
+/* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
+ * vector instruction. Matrix ops do not apply them, and trap instead. */
 void psp_vfpu_set_prefix(int which, uint32_t value);
 int  psp_vfpu_prefix_pending(void);
 void psp_vfpu_reset(void);

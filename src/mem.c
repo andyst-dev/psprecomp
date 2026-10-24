@@ -21,8 +21,15 @@ int psp_mem_watch_hits(void) { return g_whits; }
 static void note_write(uint32_t addr, uint32_t width) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
     if (g_whits++ < 8)
-        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) from fn 0x%08X\n",
-                width * 8, addr, g_wwatch, psp_trace_last());
+    {
+        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
+                width * 8, addr, g_wwatch, psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
+        /* The return sites of the guest calls in flight, innermost first:
+         * the writer is the body that called the first of them. */
+        for (const psp_frame *f = psp_cpu.frame; f && f->ret; f = f->prev)
+            fprintf(stderr, " 0x%08X", f->ret);
+        fprintf(stderr, "\n");
+    }
 }
 
 /* Watch reads of one address: "which code looks at this" is the question when

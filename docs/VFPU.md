@@ -38,7 +38,17 @@ Named and decoded:
 - **VFPU0** (`0x18`) — `vadd`, `vsub`, `vdiv`
 - **VFPU1** (`0x19`) — `vmul`, `vdot`, `vscl`, `vhdp`, `vcrs`, `vdet`
 - **VFPU3** (`0x1B`) — `vcmp`, `vmin`, `vmax`, `vscmp`, `vsge`, `vslt`
+- **VFPU4** (`0x34`) — the unary ops (`vmov` .. `vrexp2`), `vcst`, the
+  float/int conversions, `vcmov`; rs=1 the integer packing ops (`vi2uc` ..
+  `vs2i`); rs=2 `vocp`, `vsgn`
+- **VFPU5** (`0x37`) — `vpfxs`, `vpfxt`, `vpfxd`, `viim`, `vfim`
+- **VFPU6** (`0x3C`) — `vmmul`, `vtfm2/3/4`, `vmscl`, `vcrsp`/`vqmul`, `vrot`,
+  `vmmov`, `vmidt`, `vmzero`, `vmone`
+- `vnop`, `vsync`, `vflush` (`0xFFFF0000`, `0xFFFF0320`, `0xFFFF040D`)
 - **Vector width**, for all four widths, unit-tested
+
+Prefixes are applied by every vector op (src/vfpu.c); the matrix ops trap on a
+pending one instead.
 
 Everything else in the VFPU encoding space decodes to `A_VFPU_UNKNOWN`.
 

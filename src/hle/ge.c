@@ -29,6 +29,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
@@ -52,8 +53,24 @@
 #define GE_OFFSET_ADDR  0x13
 #define GE_ORIGIN_ADDR  0x14
 #define GE_TME          0x1E
+#define GE_LTE          0x17
 #define GE_ABE          0x21
 #define GE_ATE          0x22
+#define GE_ZTE          0x23
+#define GE_ZSCALE       0x44
+#define GE_ZPOS         0x47
+#define GE_RNORM        0x51
+#define GE_CMAT         0x53
+#define GE_EMC          0x54
+#define GE_DMC          0x56
+#define GE_SMC          0x57
+#define GE_SPOW         0x5B
+#define GE_ALC          0x5C
+#define GE_ALA          0x5D
+#define GE_ZBP          0x9E
+#define GE_ZBW          0x9F
+#define GE_ZTST         0xDE
+#define GE_ZMSK         0xE7
 #define GE_WMS          0x3A
 #define GE_WORLD        0x3B
 #define GE_VMS          0x3C
@@ -128,6 +145,19 @@ static uint8_t  g_clut[1024];      /* the GE's CLUT cache, filled by CLOAD */
 /* A vertex with no colour takes the material colour: AMC's RGB, AMA's alpha. */
 static uint32_t g_material = 0xFFFFFFFFu;
 
+/* Lighting. Up to four lights, in world space like the normals they are
+ * compared with. CMAT says which material colours the vertex colour stands in
+ * for: bit 0 ambient, 1 diffuse, 2 specular. */
+static struct {
+    int      enable, on[4], type[4], comp[4], cmat, rnorm;
+    uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
+    uint32_t ambient;                           /* ALC | ALA << 24 */
+    float    spow;
+    float    pos[4][3], dir[4][3], att[4][3], spot_exp[4], spot_cut[4];
+    uint32_t col[4][3];                         /* ambient, diffuse, specular */
+} g_lt;
+static uint32_t g_zbp, g_zbw;
+
 /* The transform pipeline. Matrices are uploaded one float per command, column
  * by column: world and view are 4x3 (the last column is the translation),
  * projection is 4x4. The viewport maps clip space into the GE's 4096-wide
@@ -138,7 +168,8 @@ static struct {
     float xscale, yscale, xpos, ypos;
     float offx, offy;                   /* pixels */
     float uscale, vscale, uoff, voff;
-    uint64_t behind;                    /* primitives dropped with w <= 0 */
+    float zscale, zpos;
+    uint64_t behind;                    /* vertices behind the eye */
 } g_xf;
 
 /* GE floats are the top 24 bits of an IEEE single. */
@@ -159,7 +190,7 @@ static void xf_reset(void) {
 /* Model space to screen pixels. Returns 0 for a point behind the eye.
  * ponytail: no near-plane clipping, so a primitive with any vertex behind the
  * eye is dropped whole; add clipping when 3D scenes lose triangles. */
-static int transform(const float p[3], float *sx, float *sy) {
+static int transform(const float p[3], float *sx, float *sy, float *sz) {
     const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
     float w[3], v[3], c[4];
     for (int r = 0; r < 3; r++)
@@ -171,12 +202,120 @@ static int transform(const float p[3], float *sx, float *sy) {
     if (c[3] <= 0) return 0;
     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
     *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
+    *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
     return 1;
+}
+
+/* ---- lighting ------------------------------------------------------------ */
+
+static void unpack(uint32_t c, float out[4]) {
+    for (int i = 0; i < 4; i++) out[i] = (float)((c >> (8 * i)) & 0xFF);
+}
+
+static float norm3(float v[3]) {
+    const float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0) for (int i = 0; i < 3; i++) v[i] /= l;
+    return l;
+}
+
+/* The lit colour of a vertex at model-space `p` with normal `n`, in world
+ * space: emissive + ambient light x ambient material, plus for each enabled
+ * light its ambient, its diffuse by N.L, and its specular by (N.H)^SPOW with
+ * the viewer along +z, all scaled by distance attenuation and the spot cone.
+ * Alpha is the ambient material's. */
+static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol) {
+    const float *W = g_xf.world;
+    float wp[3], wn[3];
+    for (int r = 0; r < 3; r++) {
+        wp[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
+        wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
+    }
+    if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
+    norm3(wn);
+
+    float ma[4], md[4], ms[4], e[4], al[4], out[4];
+    unpack(g_lt.cmat & 1 ? vcol : g_material, ma);
+    unpack(g_lt.cmat & 2 ? vcol : g_lt.diffuse, md);
+    unpack(g_lt.cmat & 4 ? vcol : g_lt.specular, ms);
+    unpack(g_lt.emissive, e);
+    unpack(g_lt.ambient, al);
+    for (int k = 0; k < 3; k++) out[k] = e[k] + al[k] * ma[k] / 255.0f;
+
+    for (int i = 0; i < 4; i++) {
+        if (!g_lt.on[i]) continue;
+        float L[3], att = 1.0f;
+        if (g_lt.type[i] == 0) {                /* directional: pos is the direction */
+            for (int r = 0; r < 3; r++) L[r] = g_lt.pos[i][r];
+            norm3(L);
+        } else {
+            for (int r = 0; r < 3; r++) L[r] = g_lt.pos[i][r] - wp[r];
+            const float d = norm3(L);
+            const float den = g_lt.att[i][0] + g_lt.att[i][1] * d + g_lt.att[i][2] * d * d;
+            att = den > 0 ? 1.0f / den : 1.0f;
+            if (att > 1.0f) att = 1.0f;
+            if (g_lt.type[i] == 2) {            /* spot */
+                float D[3] = { g_lt.dir[i][0], g_lt.dir[i][1], g_lt.dir[i][2] };
+                norm3(D);
+                const float cs = -(L[0] * D[0] + L[1] * D[1] + L[2] * D[2]);
+                att *= cs > g_lt.spot_cut[i] ? powf(cs, g_lt.spot_exp[i]) : 0.0f;
+            }
+        }
+        float la[4], ld[4], ls[4];
+        unpack(g_lt.col[i][0], la);
+        unpack(g_lt.col[i][1], ld);
+        unpack(g_lt.col[i][2], ls);
+        float ndl = wn[0] * L[0] + wn[1] * L[1] + wn[2] * L[2];
+        if (ndl < 0) ndl = 0;
+        if (g_lt.comp[i] == 2) ndl = powf(ndl, g_lt.spow);
+        float spec = 0;
+        if (g_lt.comp[i] == 1 && ndl > 0) {
+            float H[3] = { L[0], L[1], L[2] + 1.0f };
+            norm3(H);
+            const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
+            if (ndh > 0) spec = powf(ndh, g_lt.spow);
+        }
+        for (int k = 0; k < 3; k++)
+            out[k] += att * (la[k] * ma[k] + ld[k] * md[k] * ndl + ls[k] * ms[k] * spec) / 255.0f;
+    }
+    uint32_t c = (uint32_t)ma[3] << 24;
+    for (int k = 0; k < 3; k++) {
+        const int v = out[k] > 255.0f ? 255 : (int)out[k];
+        c |= (uint32_t)v << (8 * k);
+    }
+    return c;
+}
+
+/* Light and material commands, which come in blocks of three or four. */
+static int light_cmd(uint32_t cmd, uint32_t arg) {
+    if (cmd >= 0x18 && cmd <= 0x1B) { g_lt.on[cmd - 0x18] = arg & 1; return 1; }
+    if (cmd >= 0x5F && cmd <= 0x62) {
+        g_lt.comp[cmd - 0x5F] = (int)(arg & 3);
+        g_lt.type[cmd - 0x5F] = (int)((arg >> 8) & 3);
+        return 1;
+    }
+    if (cmd >= 0x63 && cmd <= 0x6E) { g_lt.pos[(cmd - 0x63) / 3][(cmd - 0x63) % 3] = f24(arg); return 1; }
+    if (cmd >= 0x6F && cmd <= 0x7A) { g_lt.dir[(cmd - 0x6F) / 3][(cmd - 0x6F) % 3] = f24(arg); return 1; }
+    if (cmd >= 0x7B && cmd <= 0x86) { g_lt.att[(cmd - 0x7B) / 3][(cmd - 0x7B) % 3] = f24(arg); return 1; }
+    if (cmd >= 0x87 && cmd <= 0x8A) { g_lt.spot_exp[cmd - 0x87] = f24(arg); return 1; }
+    if (cmd >= 0x8B && cmd <= 0x8E) { g_lt.spot_cut[cmd - 0x8B] = f24(arg); return 1; }
+    if (cmd >= 0x8F && cmd <= 0x9A) { g_lt.col[(cmd - 0x8F) / 3][(cmd - 0x8F) % 3] = arg; return 1; }
+    switch (cmd) {
+    case GE_LTE:   g_lt.enable = arg & 1; return 1;
+    case GE_RNORM: g_lt.rnorm = arg & 1; return 1;
+    case GE_CMAT:  g_lt.cmat = (int)(arg & 7); return 1;
+    case GE_EMC:   g_lt.emissive = arg; return 1;
+    case GE_DMC:   g_lt.diffuse = arg; return 1;
+    case GE_SMC:   g_lt.specular = arg; return 1;
+    case GE_SPOW:  g_lt.spow = f24(arg); return 1;
+    case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
+    case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
+    default:       return 0;
+    }
 }
 
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
-    uint32_t fbp, fbw, vtype, vaddr;
+    uint32_t fbp, fbw, vtype, vaddr, iaddr;
     uint64_t commands;
     uint64_t prims[8];
     uint64_t vertices;
@@ -203,6 +342,9 @@ void psp_ge_reset(void) {
     g_ds.tex_alpha = 1;
     g_ds.sc_x1 = 479;
     g_ds.sc_y1 = 271;
+    g_ds.zwrite = 1;
+    memset(&g_lt, 0, sizeof g_lt);
+    g_zbp = g_zbw = 0;
     xf_reset();
     psp_render_reset_pixels();
     g_unsupported = 0;
@@ -232,7 +374,7 @@ void psp_ge_dump_stats(FILE *out) {
     }
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
     if (g_xf.behind)
-        fprintf(out, "    %llu primitives dropped with a vertex behind the eye (no clipping)\n",
+        fprintf(out, "    %llu vertices behind the eye; their triangles dropped (no clipping)\n",
                 (unsigned long long)g_xf.behind);
     if (psp_render_unsupported_texels())
         fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
@@ -253,11 +395,13 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  *    screen space and texture coordinates are texels, and transformed mode,
  *    where positions go through world, view and projection and the viewport,
  *    and texture coordinates are normalised and scaled by UV scale/offset.
- *    Lighting, skinning, morphing and the texture matrix are not done.
- *  - Position as 16-bit or float; colour as 8888, the 16-bit formats, or
- *    none; texture coordinates as 16-bit or float texels.
- *  - Textures, CLUTs, the texture function, alpha test, blending, clear mode
- *    and scissor are decoded into psp_draw_state for the backend. No depth.
+ *    Transformed vertices are lit (four lights, per vertex) and get a depth.
+ *    Skinning, morphing, the texture matrix and near-plane clipping are not
+ *    done.
+ *  - Position, normal and texture coordinates as 8- or 16-bit or float;
+ *    colour as 8888, the 16-bit formats, or none; 8- or 16-bit indices.
+ *  - Textures, CLUTs, the texture function, alpha test, depth test, blending,
+ *    clear mode and scissor are decoded into psp_draw_state for the backend.
  *
  * The point is to close the loop from display list to visible pixels so the
  * rest can be measured against something. Everything omitted is omitted
@@ -280,7 +424,7 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
  * a fixed order (weights, texture, colour, normal, position) and each is
  * aligned to its own size, which is what makes the stride awkward enough to be
  * worth computing rather than assuming. */
-static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *pos_off) {
+static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_off, int *pos_off) {
     static const int tex_sz[4]   = { 0, 1, 2, 4 };
     static const int col_sz[8]   = { 0, 0, 0, 0, 2, 2, 2, 4 };
     static const int norm_sz[4]  = { 0, 1, 2, 4 };
@@ -301,7 +445,8 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *pos_of
     if (cs) { off = (off + cs - 1) & ~(cs - 1); *col_off = off; off += c; if (cs > align) align = cs; }
     else *col_off = -1;
     int ns = norm_sz[VT_NORMAL(vtype)];
-    if (ns) { off = (off + ns - 1) & ~(ns - 1); off += n; if (ns > align) align = ns; }
+    if (ns) { off = (off + ns - 1) & ~(ns - 1); *nrm_off = off; off += n; if (ns > align) align = ns; }
+    else *nrm_off = -1;
     int ps = pos_sz[VT_POS(vtype)];
     if (!ps) return 0;                        /* no position: nothing to draw */
     off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
@@ -310,8 +455,22 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *pos_of
     return (off + align - 1) & ~(align - 1);  /* stride */
 }
 
+/* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
+static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+    for (int i = 0; i < 3; i++) {
+        switch (fmt) {
+        case 1:  v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
+                 if (!raw) v[i] /= 128.0f; break;
+        case 2:  v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
+                 if (!raw) v[i] /= 32768.0f; break;
+        default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
+        }
+    }
+}
+
 static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
-                       int pos_off, psp_vertex *out, float pos[3]) {
+                       int nrm_off, int pos_off, psp_vertex *out) {
+    float pos[3];
     /* Through mode reads 8/16-bit values as integers; transformed mode reads
      * them as fixed point, signed for positions. */
     const int through = (int)VT_THROUGH(vtype);
@@ -342,78 +501,81 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         }
     }
 
-    const uint32_t a = addr + (uint32_t)pos_off;
-    switch (VT_POS(vtype)) {
-    case 1:   /* 8-bit */
-        for (int i = 0; i < 3; i++) pos[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
-        if (!through) for (int i = 0; i < 3; i++) pos[i] /= 128.0f;
-        break;
-    case 2:   /* 16-bit */
-        for (int i = 0; i < 3; i++) pos[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
-        if (!through) for (int i = 0; i < 3; i++) pos[i] /= 32768.0f;
-        break;
-    case 3:   /* float */
-        for (int i = 0; i < 3; i++) pos[i] = psp_read_f32(a + (uint32_t)i * 4);
-        break;
-    default:
-        return 0;
-    }
+    if (!VT_POS(vtype)) return 0;
+    read3(addr + (uint32_t)pos_off, (int)VT_POS(vtype), through, pos);
+    out->behind = 0;
     if (through) {
+        /* Through mode's depth is an unsigned 16-bit value. */
         out->x = (int)pos[0];
         out->y = (int)pos[1];
+        out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
         return 1;
     }
-    float sx, sy;
-    if (!transform(pos, &sx, &sy)) return -1;
+    if (g_lt.enable) {
+        float n[3] = { 0, 0, 1 };
+        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
+        out->rgba = light_vertex(pos, n, out->rgba);
+    }
+    float sx, sy, sz;
+    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
     out->x = (int)floorf(sx);
     out->y = (int)floorf(sy);
+    out->z = sz;
     return 1;
 }
 
 
+/* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
+ * what it is, its vertex format, and the texture state it is drawn with. */
+static int trace_frame(void) {
+    static long f = -2;
+    if (f == -2) { const char *e = getenv("PSPRECOMP_TRACE_GE"); f = e ? atol(e) : -1; }
+    return f >= 0 && (long)psp_display_vblanks() == f;
+}
+
 static void draw_prim(uint32_t type, uint32_t count) {
+    if (trace_frame())
+        fprintf(stderr, "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
+                type, count, g_ge.vtype, g_ge.vaddr, g_ds.tex_enable, g_ds.tex_fmt, g_ds.tex_w, g_ds.tex_h,
+                g_ds.tex_bw, g_ds.tex_addr, g_ds.tex_swizzle, g_ds.tex_func, g_ds.clut_fmt, g_ds.blend,
+                g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
     if (!g_ge.vaddr) { g_unsupported += count; return; }
 
-    int tex_off = -1, col_off = -1, pos_off = 0;
-    int stride = vertex_layout(g_ge.vtype, &tex_off, &col_off, &pos_off);
+    int tex_off = -1, col_off = -1, nrm_off = -1, pos_off = 0;
+    int stride = vertex_layout(g_ge.vtype, &tex_off, &col_off, &nrm_off, &pos_off);
     if (!stride) { g_unsupported += count; return; }
 
-    /* Decode the whole batch, then hand it to the backend in one call.
-     *
+    /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
      * Format decoding stays here rather than in each backend: the stride
      * arithmetic and component alignment are fiddly, and duplicating them per
-     * backend means every backend is wrong in its own way. Wrong once,
-     * centrally, is at least diagnosable. */
-    enum { BATCH = 256 };
-    psp_vertex v[BATCH];
-    const psp_render_backend *be = psp_render_current();
+     * backend means every backend is wrong in its own way. */
+    static const int ISZ[4] = { 0, 1, 2, 4 };
+    const int isz = ISZ[VT_INDEX(g_ge.vtype)];
+    if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
 
-    uint32_t done = 0;
-    while (done < count) {
-        uint32_t n = count - done;
-        if (n > BATCH) n = BATCH;
-
-        /* Strips are order-dependent, so a batch boundary must overlap by two
-         * vertices or the triangle spanning it is lost. */
-        uint32_t decoded = 0;
-        int behind = 0;
-        for (; decoded < n; decoded++) {
-            float pos[3];
-            int ok = read_vertex(g_ge.vaddr + (done + decoded) * (uint32_t)stride,
-                                 g_ge.vtype, tex_off, col_off, pos_off, &v[decoded], pos);
-            if (!ok) break;
-            if (ok < 0) behind = 1;
-        }
-        if (!decoded) break;
-        if (behind) { g_xf.behind++; done += decoded; continue; }
-
-        be->draw((int)type, v, (int)decoded, &g_ds);
-
-        if (type == 4 && decoded == BATCH && done + decoded < count)
-            done += decoded - 2;     /* strip overlap */
-        else
-            done += decoded;
+    static psp_vertex v[65536];
+    uint32_t n = 0;
+    for (; n < count; n++) {
+        uint32_t idx = n;
+        if (isz == 1)      idx = psp_read8(g_ge.iaddr + n);
+        else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
+        else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
+        if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
+                         tex_off, col_off, nrm_off, pos_off, &v[n])) break;
     }
+    /* The GE leaves its read pointer after what a primitive consumed, so the
+     * next PRIM continues from there without a new VADDR (or IADDR). */
+    if (isz) g_ge.iaddr += count * (uint32_t)isz;
+    else     g_ge.vaddr += count * (uint32_t)stride;
+
+    if (trace_frame()) {
+        fprintf(stderr, "  mat %08X cbp %08X lt %d tex0 %08X\n", g_material, g_cbp, g_lt.enable,
+                psp_read32(g_ds.tex_addr));
+        for (uint32_t k = 0; k < n && k < 16; k++)
+            fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
+                    (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
+    }
+    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
 }
 
 /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
@@ -441,6 +603,7 @@ static void run_list(ge_queue *q) {
         uint32_t arg  = word & 0x00FFFFFF;
         q->list += 4;
         g_ge.commands++;
+        if (trace_frame()) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
 
         switch (cmd) {
         case GE_NOP:
@@ -540,6 +703,21 @@ static void run_list(ge_queue *q) {
             g_ds.clear = arg & 1;
             g_ds.clear_color = (arg >> 8) & 1;
             g_ds.clear_alpha = (arg >> 9) & 1;
+            g_ds.clear_depth = (arg >> 10) & 1;
+            break;
+
+        /* Depth. The buffer is 16 bits per pixel in VRAM; ZBW carries the
+         * address's high byte like FBW does. */
+        case GE_ZTE:    g_ds.ztest = arg & 1; break;
+        case GE_ZTST:   g_ds.zfunc = (int)(arg & 7); break;
+        case GE_ZMSK:   g_ds.zwrite = !(arg & 1); break;
+        case GE_ZSCALE: g_xf.zscale = f24(arg); break;
+        case GE_ZPOS:   g_xf.zpos = f24(arg); break;
+        case GE_ZBP:
+        case GE_ZBW:
+            if (cmd == GE_ZBP) g_zbp = arg; else g_zbw = arg;
+            g_ds.zaddr = PSP_VRAM_BASE | ((((g_zbw & 0xFF0000u) << 8) | g_zbp) & (PSP_VRAM_SIZE - 1));
+            g_ds.zbw = (int)(g_zbw & 0xFFFF);
             break;
 
         /* TBP0 carries the low 24 bits and TBW0 bits 24-31 in its top byte. */
@@ -609,9 +787,10 @@ static void run_list(ge_queue *q) {
         case GE_DFIX:  g_ds.blend_dfix = arg; break;
 
         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
-        case GE_IADDR: break;
+        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 
         default:
+            if (light_cmd(cmd, arg)) break;
             /* A real state command we do not decode individually. Counted --
              * and, for the first few, named. "240 commands not individually
              * decoded" hides whether the game is configuring a draw or just

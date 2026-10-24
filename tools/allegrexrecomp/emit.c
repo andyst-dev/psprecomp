@@ -428,6 +428,34 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VCMP:
         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
+    case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
+        const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
+                         in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :
+                         in->op == A_VCRS ? "vcrs" : in->op == A_VCRSP ? "vcrsp" : "vdet";
+        fprintf(f, "%spsp_%s(%u, %u, %u, %u);\n", ind, fn, in->vd, in->vs, in->vt, in->vsize);
+        return;
+    }
+    case A_VROT:
+        fprintf(f, "%spsp_vrot(%u, %u, %u, %u);\n", ind, in->vd, in->vs,
+                (in->raw >> 16) & 0x1F, in->vsize);
+        return;
+    case A_VI2UC: case A_VI2C: case A_VI2US: case A_VI2S:
+    case A_VUC2I: case A_VC2I: case A_VUS2I: case A_VS2I: {
+        static const char *const P[] = { "PSP_VP_I2UC", "PSP_VP_I2C", "PSP_VP_I2US", "PSP_VP_I2S",
+                                         "PSP_VP_UC2I", "PSP_VP_C2I", "PSP_VP_US2I", "PSP_VP_S2I" };
+        fprintf(f, "%spsp_vpack(%s, %u, %u, %u);\n", ind, P[in->op - A_VI2UC],
+                in->vd, in->vs, in->vsize);
+        return;
+    }
+    /* mfv/mtv: the low byte names the lane, or with bit 7 a control register
+     * (mfvc/mtvc), so it is passed whole rather than as the 7-bit vd. */
+    case A_MFV:
+        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+        fprintf(f, "%s%s = psp_mfv(0x%02Xu);\n", ind, rt, in->raw & 0xFF); return;
+    case A_MTV:
+        fprintf(f, "%spsp_mtv(0x%02Xu, %s);\n", ind, in->raw & 0xFF, rt); return;
+    case A_VNOP:
+        fprintf(f, "%s;  /* vnop / vsync / vflush */\n", ind); return;
 
     /* Prefixes gate the arithmetic above: with one pending, the next vector op
      * traps instead of computing the unprefixed answer. Emitting these is what
@@ -437,7 +465,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
     case A_VMOV: case A_VABS: case A_VNEG: case A_VZERO: case A_VONE:
     case A_VRCP: case A_VRSQ: case A_VSQRT: case A_VSIN: case A_VCOS:
     case A_VEXP2: case A_VLOG2: case A_VSAT0: case A_VSAT1:
-    case A_VNRCP: case A_VNSIN: case A_VASIN: {
+    case A_VNRCP: case A_VNSIN: case A_VASIN: case A_VOCP: case A_VSGN: case A_VREXP2: {
         static const struct { a_op op; const char *sel; } U[] = {
             { A_VMOV, "PSP_VU_MOV" },   { A_VABS, "PSP_VU_ABS" },
             { A_VNEG, "PSP_VU_NEG" },   { A_VZERO,"PSP_VU_ZERO" },
@@ -447,7 +475,8 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
             { A_VEXP2,"PSP_VU_EXP2" },  { A_VLOG2,"PSP_VU_LOG2" },
             { A_VSAT0,"PSP_VU_SAT0" },  { A_VSAT1,"PSP_VU_SAT1" },
             { A_VNRCP,"PSP_VU_NRCP" },  { A_VNSIN,"PSP_VU_NSIN" },
-            { A_VASIN,"PSP_VU_ASIN" },
+            { A_VASIN,"PSP_VU_ASIN" },  { A_VOCP, "PSP_VU_OCP" },
+            { A_VSGN, "PSP_VU_SGN" },   { A_VREXP2,"PSP_VU_REXP2" },
         };
         for (size_t k = 0; k < sizeof U / sizeof U[0]; k++) {
             if (U[k].op != in->op) continue;
@@ -788,7 +817,13 @@ static void emit_function(ectx *c, const a_func *fn) {
          * 0x15774 loads eight kilobytes through $v0. The taken path left $v0
          * zero, so the game read the module's own code as a table and reported
          * the word `lw $ra,12($sp)` -- 0x8FBF000C -- as an address. 30 branch
-         * sites in this module have a slot another body owns. */
+         * sites in this module have a slot another body owns.
+         *
+         * A jump that does not come back (j, jr) runs a foreign slot the same
+         * way, a copy before it leaves. Dropping it lost the `addiu $sp,$sp,16`
+         * of Pendemonium's `jr $ra` at 0x44AEC, whose slot became an entry
+         * because `lui $at,4 / ori $at,$at,0x4AF0` builds a struct offset that
+         * looks like a code address: every call leaked 16 bytes of stack. */
         const int taken_slot = slot_decoded && !have_slot && slot_repeatable(&slot);
 
         if (in.is_branch && in.is_call) {        /* bgezal / bltzal / *all */
@@ -984,7 +1019,7 @@ static void emit_function(ectx *c, const a_func *fn) {
              *
              * jr reads $ra before its delay slot, as for jr $rN below. */
             fprintf(f, "    { uint32_t _t = r_ra;\n");
-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             fprintf(f, "    if (psp_ra_is_jump(_t)) { psp_dispatch(_t); return; } }\n");
             /* Only a genuine `jr $ra` is expected to leave $sp as it found it.
              * Tail jumps and cross-function transfers are emitted as `return`
@@ -1001,7 +1036,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         if (in.is_indirect) {                    /* jr $rN — computed jump */
             /* The target is read before the delay slot, as for jalr above. */
             fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             fprintf(f, "    psp_dispatch(_t);\n    return; }\n");
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
             a += 4;
@@ -1009,7 +1044,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         }
 
         if (in.is_jump) {                        /* j */
-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             if (owned_by(an, in.target, owner) && !is_function(an, in.target)) {
                 fprintf(f, "    goto L_%08X;\n", in.target);
             } else {

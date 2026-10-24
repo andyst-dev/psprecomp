@@ -2,13 +2,14 @@
  *
  * Two things get pinned here. The first is register addressing, because the
  * layout is what makes a matrix row and column alias correctly and everything
- * else is built on it. The second is that a pending prefix makes arithmetic
- * *trap* rather than compute: partial VFPU that ignores prefixes produces
- * silently wrong numbers, which is the one failure mode this project has spent
- * its whole life avoiding.
+ * else is built on it. The second is the operand prefixes, which rewrite
+ * the inputs and outputs of the next op: ignoring them produces silently wrong
+ * numbers, so they are applied, and the matrix ops that do not apply them
+ * trap instead.
  */
 
 #include "psprecomp/vfpu.h"
+#include "psprecomp/recomp_rt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -160,36 +161,139 @@ static void test_arithmetic(void) {
     for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i] + b[i], "vadd into its own source");
 }
 
-static void test_prefix_traps(void) {
+/* Prefixes rewrite operands rather than trapping. Each case is a form WTF
+ * uses: a broadcast before a clamp, constants and negation building box
+ * corners, and saturate/mask on the destination. */
+static void test_prefixes(void) {
     psp_vfpu_reset();
 
     const float a[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float b[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+    float out[4];
     set_quad(0x00, a);
-    set_quad(0x04, a);
+    set_quad(0x04, b);
+    const uint64_t traps = psp_vfpu_trap_count();
 
-    uint64_t before = psp_vfpu_trap_count();
+    /* vpfxt [x,x,x,x]: every lane of vt reads lane 0. */
+    psp_vfpu_set_prefix(1, 0x000000);
+    psp_vmax(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], 5.0f, "vmax against a broadcast lane");
+    CHECK(!psp_vfpu_prefix_pending(), "the prefix is consumed");
 
-    /* With no prefix pending, arithmetic computes. */
-    psp_vadd(0x08, 0x00, 0x04, 4);
-    CHECK(psp_vfpu_trap_count() == before, "no prefix, no trap");
+    /* vpfxs [1, -w, z, x]: a constant, a negated swizzle, two plain swizzles. */
+    psp_vfpu_set_prefix(0, (1 | 3 << 2 | 2 << 4 | 0 << 6) | (1 << 12) | (1 << 17));
+    psp_vunary(PSP_VU_MOV, 0x08, 0x00, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 1.0f, "constant lane");
+    CHECK_F(out[1], -4.0f, "negated swizzle");
+    CHECK_F(out[2], 3.0f, "swizzle z");
+    CHECK_F(out[3], 1.0f, "swizzle x");
 
-    /* With one pending, it must trap instead of quietly ignoring it. */
-    psp_vfpu_set_prefix(0, 0x00000055);
-    CHECK(psp_vfpu_prefix_pending(), "prefix registers as pending");
+    /* No prefix is identity: the same op again reads the plain register. */
+    psp_vunary(PSP_VU_MOV, 0x08, 0x00, 4);
+    get_quad(0x08, out);
+    for (int i = 0; i < 4; i++) CHECK_F(out[i], a[i], "no prefix after consumption");
 
-    float before_out[4];
-    get_quad(0x0C, before_out);
-    psp_vadd(0x0C, 0x00, 0x04, 4);
+    /* vpfxd: lane 0 saturated to [0, 1], lane 3 masked off. */
+    const float keep[4] = { 9.0f, 9.0f, 9.0f, 99.0f };
+    set_quad(0x08, keep);
+    psp_vfpu_set_prefix(2, 0x1 | 1 << 11);
+    psp_vsub(0x08, 0x00, 0x04, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 0.0f, "saturated lane");
+    CHECK_F(out[1], -4.0f, "plain lane");
+    CHECK_F(out[3], 99.0f, "masked lane is not written");
+    CHECK(psp_vfpu_trap_count() == traps, "vector ops with prefixes do not trap");
 
-    CHECK(psp_vfpu_trap_count() == before + 1,
-          "a pending prefix traps rather than computing");
-    CHECK(!psp_vfpu_prefix_pending(), "the prefix is consumed by the attempt");
+    /* Matrix ops do not apply prefixes, so a pending one still traps. */
+    psp_vfpu_set_prefix(0, 0x55);
+    psp_vmmul(0x10, 0x00, 0x04, 4);
+    CHECK(psp_vfpu_trap_count() == traps + 1, "a prefixed matrix op traps");
+    CHECK(!psp_vfpu_prefix_pending(), "and consumes the prefix");
+}
 
-    float after_out[4];
-    get_quad(0x0C, after_out);
-    CHECK(memcmp(before_out, after_out, sizeof after_out) == 0,
-          "the trapped op wrote nothing -- silently wrong output is the one "
-          "outcome worse than an error");
+static void set_bits(uint32_t vreg, int size, const uint32_t *bits) {
+    int r[4];
+    psp_vfpu_regs(vreg, size, r);
+    for (int i = 0; i < size; i++) psp_cpu.v[r[i]] = psp_bits_to_f32(bits[i]);
+}
+
+/* The ops WTF's colour, rotation and geometry helpers need. */
+static void test_more_ops(void) {
+    psp_vfpu_reset();
+    int r[4];
+    float out[4];
+
+    /* WTF's float-to-colour helper ends vf2iz, vi2uc, mfv: four ints holding
+     * byte << 23 become one packed word, negatives clamped to 0. */
+    const uint32_t ints[4] = { 255u << 23, 1u << 23, 0x80000000u, 128u << 23 };
+    set_bits(0x00, 4, ints);
+    psp_vpack(PSP_VP_I2UC, 0x08, 0x00, 4);
+    CHECK(psp_mfv(0x08) == 0x800001FFu, "vi2uc packs to 0x%08X", psp_mfv(0x08));
+
+    /* vs2i.s: the two halfwords of one lane become two lanes, value << 16. */
+    const uint32_t halves[1] = { 0x80017FFFu };
+    set_bits(0x08, 1, halves);
+    psp_vpack(PSP_VP_S2I, 0x10, 0x08, 1);
+    psp_vfpu_regs(0x10, 2, r);
+    CHECK(psp_f32_to_bits(psp_cpu.v[r[0]]) == 0x7FFF0000u &&
+          psp_f32_to_bits(psp_cpu.v[r[1]]) == 0x80010000u, "vs2i unpacks halfwords");
+
+    /* mtv/mfv move bits, not values; 0x83 is mfvc of the condition codes. */
+    psp_mtv(0x08, 0x3F800000u);
+    CHECK(psp_mfv(0x08) == 0x3F800000u, "mtv / mfv round trip");
+    const float one[4] = { 1, 1, 1, 1 }, mixed[4] = { 1, 0, 1, 0 };
+    set_quad(0x00, one);
+    set_quad(0x04, mixed);
+    psp_vcmp(1, 0x00, 0x04, 4);               /* EQ */
+    CHECK(psp_mfv(0x83) == (0x5u | 1u << 4), "mfvc reads the condition codes: 0x%X", psp_mfv(0x83));
+
+    /* vrot imm 0x09: cos in lane 1, sin in lane 2; 0.5 is 45 degrees. */
+    psp_vfpu_regs(0x08, 1, r);
+    psp_cpu.v[r[0]] = 0.5f;
+    psp_vrot(0x10, 0x08, 0x09, 4);
+    get_quad(0x10, out);
+    CHECK_F(out[0], 0.0f, "vrot lane 0");
+    CHECK_F(out[1], 0.70710678f, "vrot cos lane");
+    CHECK_F(out[2], 0.70710678f, "vrot sin lane");
+    CHECK_F(out[3], 0.0f, "vrot lane 3");
+    psp_vrot(0x10, 0x08, 0x19, 4);           /* negated sin */
+    get_quad(0x10, out);
+    CHECK_F(out[2], -0.70710678f, "vrot negated sin");
+    psp_vrot(0x10, 0x08, 0x00, 4);           /* same lane: sin everywhere else */
+    get_quad(0x10, out);
+    CHECK_F(out[0], 0.70710678f, "vrot shared lane: cos");
+    CHECK_F(out[3], 0.70710678f, "vrot shared lane: sin elsewhere");
+
+    /* vcrsp.t: x cross y is z. */
+    const float x[4] = { 1, 0, 0, 0 }, y[4] = { 0, 1, 0, 0 };
+    set_quad(0x00, x);
+    set_quad(0x04, y);
+    psp_vcrsp(0x08, 0x00, 0x04, 3);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 0.0f, "cross x");
+    CHECK_F(out[1], 0.0f, "cross y");
+    CHECK_F(out[2], 1.0f, "cross z");
+
+    /* vidt writes the identity column the register names: C730 (0x1F) is
+     * (0, 0, 0, 1), C710 (0x1D) is (0, 1, 0, 0). WTF keeps s733 = 1 this way. */
+    psp_vidt(0x1F, 4);
+    get_quad(0x1F, out);
+    CHECK_F(out[0], 0.0f, "vidt C730 x");
+    CHECK_F(out[3], 1.0f, "vidt C730 w");
+    psp_vidt(0x1D, 4);
+    get_quad(0x1D, out);
+    CHECK_F(out[1], 1.0f, "vidt C710 y");
+    CHECK_F(out[0] + out[2] + out[3], 0.0f, "vidt C710 elsewhere");
+
+    /* vocp: 1 - x, the other half of a lerp. */
+    const float t[4] = { 0.25f, 0, 1, 2 };
+    set_quad(0x00, t);
+    psp_vunary(PSP_VU_OCP, 0x08, 0x00, 4);
+    get_quad(0x08, out);
+    CHECK_F(out[0], 0.75f, "vocp");
+    CHECK_F(out[3], -1.0f, "vocp past 1");
 }
 
 static void test_compare(void) {
@@ -454,7 +558,8 @@ int main(void) {
     test_register_addressing();
     test_load_store();
     test_arithmetic();
-    test_prefix_traps();
+    test_prefixes();
+    test_more_ops();
     test_compare();
     test_matrix_ops();
     test_matrix_transform();

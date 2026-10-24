@@ -77,7 +77,7 @@ backend is wrong the same way, which is at least diagnosable.
 
 | Backend | State | Notes |
 |---|---|---|
-| **software** | Working | The reference. Triangles, strips, fans and sprites; textures (all non-DXT formats, swizzle, CLUTs) through the shared `psp_tex_fetch()`; texture function, alpha test, blend, clear mode, scissor. Tests assert pixel positions and colours. No depth, no GPU, no dependencies, runs in CI. |
+| **software** | Working | The reference. Triangles, strips, fans and sprites; textures (all formats including DXT, swizzle, CLUTs) through the shared `psp_tex_fetch()`; texture function, alpha test, depth test, blend, clear mode, scissor; lighting and indexed drawing in the interpreter. Tests assert pixel positions and colours. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
 | **sdl3-vulkan** | Not started | The intended presentation path. See below. |
 

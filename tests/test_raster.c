@@ -519,6 +519,158 @@ static void test_framebuffer_is_vram_relative(void) {
               ram_probe, psp_read32(ram_probe));
 }
 
+/* ---- DXT, depth, sampling, vertex flow, lighting ------------------------ */
+
+/* One DXT1 block, PSP layout: the 2-bit indices first (a byte per row), then
+ * the two 565 endpoints. Endpoint 0 > endpoint 1 selects four-colour mode, so
+ * indices 2 and 3 are the 2/3 and 1/3 blends. */
+static void test_dxt1(void) {
+    psp_write32(TEX, 0xE4E4E4E4u);                 /* every row: 0, 1, 2, 3 */
+    psp_write16(TEX + 4, 0xF800);                  /* endpoint 0: blue */
+    psp_write16(TEX + 6, 0x001F);                  /* endpoint 1: red */
+    psp_ge_reset();
+    clear_fb();
+    begin_tex_list(8, 2, 2, 0);                    /* DXT1, 4x4 */
+    tvertex(0, 0, 0, 0, 0, 0xFFFFFFFFu);
+    tvertex(1, 4, 4, 4, 4, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(0, 0) == 0xFFFF0000u, "DXT1 index 0 is endpoint 0 (blue): 0x%08X", pixel(0, 0));
+    CHECK(pixel(1, 0) == 0xFF0000FFu, "DXT1 index 1 is endpoint 1 (red): 0x%08X", pixel(1, 0));
+    CHECK(pixel(2, 0) == 0xFFAA0055u, "DXT1 index 2 is 2/3 endpoint 0: 0x%08X", pixel(2, 0));
+    CHECK(pixel(3, 3) == 0xFF5500AAu, "DXT1 index 3 is 1/3 endpoint 0: 0x%08X", pixel(3, 3));
+    CHECK(psp_render_unsupported_texels() == 0, "no texel was undecodable");
+}
+
+/* Through-mode sprites with a depth: GEQUAL keeps the nearer (larger) one,
+ * and an equal depth passes, so coplanar layers draw in order. */
+static void zsprite(int idx, int x0, int y0, int x1, int y1, int z, uint32_t rgba) {
+    for (int k = 0; k < 2; k++) {
+        uint32_t a = VERTS + (uint32_t)(idx + k) * 12;
+        psp_write32(a, rgba);
+        psp_write16(a + 4, (uint16_t)(k ? x1 : x0));
+        psp_write16(a + 6, (uint16_t)(k ? y1 : y0));
+        psp_write16(a + 8, (uint16_t)z);
+    }
+}
+
+static void test_depth(void) {
+    const uint32_t ZB = 0x00110000u;               /* VRAM-relative, like FBP */
+    for (uint32_t i = 0; i < 16u * 480u; i++) psp_write16(PSP_VRAM_BASE + ZB + i * 2, 0);
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    cmd(0x9E, ZB & 0xFFFFFF);                      /* ZBP */
+    cmd(0x9F, 480);                                /* ZBW */
+    cmd(0x23, 1);                                  /* ZTE */
+    cmd(0xDE, 7);                                  /* ZTST GEQUAL */
+    zsprite(0, 0, 0, 8, 8, 100, 0xFF0000FFu);
+    zsprite(2, 4, 0, 12, 8, 50, 0xFF00FF00u);      /* farther: hidden where they overlap */
+    zsprite(4, 0, 4, 4, 8, 100, 0xFFFF0000u);      /* equal: drawn */
+    cmd(0x04, (6u << 16) | 6);
+    end_list();
+    CHECK(pixel(2, 2) == 0xFF0000FFu, "nearer sprite drawn: 0x%08X", pixel(2, 2));
+    CHECK(pixel(6, 2) == 0xFF0000FFu, "farther sprite hidden behind it: 0x%08X", pixel(6, 2));
+    CHECK(pixel(10, 2) == 0xFF00FF00u, "farther sprite drawn where uncovered: 0x%08X", pixel(10, 2));
+    CHECK(pixel(2, 6) == 0xFFFF0000u, "equal depth passes GEQUAL: 0x%08X", pixel(2, 6));
+}
+
+/* Attributes are sampled at pixel centres. This is WTF's LED panel: a quad
+ * 243 pixels wide mapping 244 texels, 16 rows 1:1, as two triangles. At the
+ * pixel corner the v of row 2 came out 1.99999 and floored to row 1, and the
+ * panel -- lit dots on every other row -- lost whole rows. */
+static void test_samples_at_pixel_centres(void) {
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 256; x++)
+            psp_write32(TEX + (uint32_t)(y * 256 + x) * 4, 0xFF000000u | (uint32_t)(y + 1));
+    psp_ge_reset();
+    clear_fb();
+    begin_tex_list(3, 8, 4, 0);                    /* 8888, 256x16 */
+    cmd(0xC9, (1u << 8) | 3);                      /* replace */
+    tvertex(0, 118, 159, 0, 0, 0xFFFFFFFFu);
+    tvertex(1, 361, 159, 244, 0, 0xFFFFFFFFu);
+    tvertex(2, 118, 175, 0, 16, 0xFFFFFFFFu);
+    tvertex(3, 361, 175, 244, 16, 0xFFFFFFFFu);
+    tvertex(4, 118, 175, 0, 16, 0xFFFFFFFFu);
+    tvertex(5, 361, 159, 244, 0, 0xFFFFFFFFu);
+    cmd(0x04, (3u << 16) | 6);
+    end_list();
+    int bad = 0, first = -1;
+    for (int y = 0; y < 16; y++)
+        for (int x = 120; x < 360; x += 7)
+            if (pixel(x, 159 + y) != (0xFF000000u | (uint32_t)(y + 1))) { bad++; if (first < 0) first = y; }
+    CHECK(bad == 0, "every row samples its own texel row: %d wrong, first in row %d", bad, first);
+}
+
+/* A PRIM leaves the vertex pointer after what it used, so a second PRIM with
+ * no VADDR continues from there; with an index type, vertices come through
+ * the index list instead and IADDR advances. */
+static void test_vertex_flow(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 0, 0, 0xFF0000FFu);
+    vertex(1, 4, 4, 0xFF0000FFu);
+    vertex(2, 10, 0, 0xFF00FF00u);
+    vertex(3, 14, 4, 0xFF00FF00u);
+    cmd(0x04, (6u << 16) | 2);
+    cmd(0x04, (6u << 16) | 2);                     /* no new VADDR */
+    psp_write8(VERTS + 0x400, 3);                  /* indices: vertex 2 then 3 */
+    psp_write8(VERTS + 0x401, 2);
+    psp_write8(VERTS + 0x402, 0);
+    psp_write8(VERTS + 0x403, 1);
+    cmd(0x12, VTYPE_2D | (1u << 11));              /* 8-bit indices */
+    cmd(0x01, VERTS & 0xFFFFFF);
+    cmd(0x02, (VERTS + 0x400) & 0xFFFFFF);         /* IADDR */
+    cmd(0x04, (6u << 16) | 2);                     /* corners 3, 2: still the green box */
+    cmd(0x04, (6u << 16) | 2);                     /* IADDR moved on: 0, 1, the red box */
+    end_list();
+    CHECK(pixel(2, 2) == 0xFF0000FFu, "first sprite: 0x%08X", pixel(2, 2));
+    CHECK(pixel(12, 2) == 0xFF00FF00u, "second PRIM continued from the vertex pointer: 0x%08X", pixel(12, 2));
+    CHECK(psp_ge_pixels() == 4 * 16, "indexed sprites drew the same boxes again: %llu pixels",
+          (unsigned long long)psp_ge_pixels());
+}
+
+/* One directional light along +z on a face whose normal is +z: the face takes
+ * the full diffuse colour. Turned to +x, N.L is 0 and only ambient (none)
+ * remains. Lights are in world space and act only on transformed vertices. */
+static void lit_quad(float lx, float lz) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, (3u << 5) | (3u << 7));              /* float normal, float position */
+    cmd(0x01, VERTS & 0xFFFFFF);
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+    cmd(0x17, 1);                                  /* LTE */
+    cmd(0x18, 1);                                  /* light 0 on */
+    cmd(0x5F, 0);                                  /* directional, diffuse only */
+    fcmd(0x63, lx); fcmd(0x64, 0); fcmd(0x65, lz);
+    cmd(0x90, 0xFFFFFF);                           /* light 0 diffuse: white */
+    cmd(0x56, 0x0000FF);                           /* material diffuse: red */
+    cmd(0x5C, 0);                                  /* no ambient light */
+    const float q[4][2] = { { -0.5f, 0.5f }, { 0.5f, 0.5f }, { -0.5f, -0.5f }, { 0.5f, -0.5f } };
+    for (int i = 0; i < 4; i++) {
+        uint32_t a = VERTS + (uint32_t)i * 24;
+        psp_write32(a + 0, 0); psp_write32(a + 4, 0); psp_write32(a + 8, fbits(1.0f));
+        psp_write32(a + 12, fbits(q[i][0])); psp_write32(a + 16, fbits(q[i][1])); psp_write32(a + 20, 0);
+    }
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+}
+
+static void test_lighting(void) {
+    lit_quad(0, 1);
+    CHECK(pixel(240, 136) == 0xFF0000FFu, "light along the normal: full diffuse: 0x%08X", pixel(240, 136));
+    lit_quad(1, 0);
+    CHECK(pixel(240, 136) == 0xFF000000u, "light across the face: no diffuse: 0x%08X", pixel(240, 136));
+}
+
 int main(void) {
     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
     psp_cpu_reset();
@@ -536,6 +688,11 @@ int main(void) {
     test_clut4_swizzled();
     test_alpha_test_and_blend();
     test_clear_mode_and_scissor();
+    test_dxt1();
+    test_depth();
+    test_samples_at_pixel_centres();
+    test_vertex_flow();
+    test_lighting();
     test_backend_selection();
 
     psp_mem_free();
