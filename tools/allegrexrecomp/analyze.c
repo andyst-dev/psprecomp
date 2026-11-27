@@ -2,6 +2,7 @@
 
 #include "analyze.h"
 #include <stdlib.h>
+#include <string.h>
 #include "decode.h"
 
 #include <stdio.h>
@@ -80,6 +81,13 @@ typedef struct {
      * fall-through run an epilogue it does not own. */
     u32list    *cross_from;
 } walk_ctx;
+
+/* An opt-out has to be explicit: presence alone is not enough, so
+ * PSPPRECOMP_NO_INTRA_MERGE=0 keeps the merge on. */
+static int env_flag_set(const char *name) {
+    const char *v = getenv(name);
+    return v && *v && strcmp(v, "0") && strcmp(v, "false") && strcmp(v, "no");
+}
 
 static int is_known_entry(const walk_ctx *c, uint32_t addr) {
     if (!a_in_range(c->an, addr)) return 0;
@@ -630,7 +638,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
                         }
                 }
             }
-            if (!intra || getenv("PSPRECOMP_NO_INTRA_MERGE")) u32_push(&targets, t);
+            if (!intra || env_flag_set("PSPRECOMP_NO_INTRA_MERGE")) u32_push(&targets, t);
         }
         cross.n = 0; cross_from.n = 0;
         indirects.n = 0;
